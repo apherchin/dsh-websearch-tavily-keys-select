@@ -24,28 +24,28 @@ mkdirSync(tmpRoot, { recursive: true })
 const MUTANTS = [
 	{
 		name: 'M1 源顺序倒过来（腿序不再按文档顺序）',
-		file: 'host/core.mjs',
+		file: 'bundle/host/core.mjs',
 		find: 'const legs = sources.map((source) => ({ kind: source.kind, id: source.id, ref: source.ref }))',
 		replace: 'const legs = sources.slice().reverse().map((source) => ({ kind: source.kind, id: source.id, ref: source.ref }))',
 		test: 'test/core-chain.test.mjs',
 	},
 	{
 		name: 'M2 忽略 mode（一律按 env 解析，明文源失效）',
-		file: 'host/core.mjs',
+		file: 'bundle/host/core.mjs',
 		find: "if (raw.mode === 'env') {",
 		replace: 'if (true) {',
 		test: 'test/core-validate.test.mjs',
 	},
 	{
 		name: 'M3 上限 3 改成 4',
-		file: 'host/core.mjs',
+		file: 'bundle/host/core.mjs',
 		find: 'export const MAX_SOURCES = 3',
 		replace: 'export const MAX_SOURCES = 4',
 		test: 'test/core-validate.test.mjs',
 	},
 	{
 		name: 'M4 删掉「只读凭据不 unset」的守卫（会跟环境变量较劲）',
-		file: 'host/index-v5.mjs',
+		file: 'bundle/host/index-v5.mjs',
 		find: 'if (info?.writable === false) continue',
 		replace: 'if (false) continue',
 		test: 'test/route.test.mjs',
@@ -54,7 +54,7 @@ const MUTANTS = [
 		// 这一条正是 2026-09-29 真机 404 的根因形状：不再"等 connection 服务就绪"，
 		// 而是在 apply 时直接去看它。空依赖 ⇒ 回调立刻跑，此时服务还没提供。
 		name: 'M5 把「等 connection 就绪」的嵌套注入换成不等（真机 404 的形状）',
-		file: 'host/index-v5.mjs',
+		file: 'bundle/host/index-v5.mjs',
 		find: "ctx.inject(['connection'], (connectionCtx) => {",
 		replace: 'ctx.inject([], (connectionCtx) => {',
 		test: 'test/route.test.mjs',

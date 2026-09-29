@@ -13,7 +13,9 @@ await test('bundle 包声明了 dsh.bundle.patch（官方契约：没有它就�
 	const pkg = readJson('bundle/package.json')
 	assert.equal(pkg.dsh?.bundle?.patch, './cordis.patch.yml')
 	assert.equal(pkg.type, 'module')
-	assert.equal(pkg.main, 'index-v5.mjs')
+	assert.equal(pkg.main, './host/index-v5.mjs', 'host/ 已并入包内（npm 包不能引用 ../host）')
+	assert.equal(pkg.name, 'dsh-websearch-tavily-keys-select', '发布用的包名')
+	assert.equal(pkg.private, undefined, 'private 必须去掉，否则 npm 拒绝发布')
 })
 
 await test('bundle patch 只剩两条行：兜底源行 + 链本体行', () => {
@@ -53,31 +55,45 @@ await test('行包 dsh-search-deepseek：仍是 host-only（没有 dsh.client）
 	assert.equal(pkg.main, 'index.mjs')
 })
 
-await test('两个行包的 index.mjs 都 re-export 同一个宿主模块（一个模块实例 = 一份注册表）', () => {
+await test('两个行包的 index.mjs 都按**包名** re-export 同一个宿主模块（一个模块实例 = 一份注册表）', () => {
 	for (const rel of ['row-chain/index.mjs', 'row-deepseek/index.mjs']) {
 		const text = read(rel)
-		assert.ok(text.includes("from '../dsh-web-search-chain/index-v5.mjs'"), rel)
+		// ⚠️ 必须是包名导入：相对路径 `../dsh-web-search-chain/index-v5.mjs` 在 pnpm 的虚拟 store
+		//    布局下解析不到（`.pnpm/dsh-search-chain@…/node_modules/` 里没有该兄弟目录）⇒ 发布阻塞点。
+		assert.ok(text.includes("from 'dsh-websearch-tavily-keys-select'"), rel)
+		// 只禁"相对路径导入"这种形态（注释里提到旧路径是允许的 —— 那是在解释为什么不能这么写）
+		assert.equal(/from\s+['"]\.\.\/dsh-web-search-chain/.test(text), false, `${rel} 仍用相对路径导入`)
 		assert.ok(text.includes('export { name, inject, apply }'), rel)
 	}
 })
 
-await test('bundle 包只声明两个行包依赖（file:），没有别的依赖', () => {
+await test('两个行包都声明了 bundle 包依赖（裸包名导入要能解析）', () => {
+	for (const rel of ['row-chain/package.json', 'row-deepseek/package.json']) {
+		const pkg = readJson(rel)
+		assert.equal(pkg.dependencies?.['dsh-websearch-tavily-keys-select'], '^2.0.0', rel)
+		assert.equal(pkg.private, undefined, `${rel} 的 private 必须去掉`)
+	}
+})
+
+await test('bundle 包只声明两个行包依赖（发布用版本号；file: 无法发布）', () => {
 	const pkg = readJson('bundle/package.json')
 	assert.deepEqual(pkg.dependencies, {
-		'dsh-search-chain': 'file:../dsh-search-chain',
-		'dsh-search-deepseek': 'file:../dsh-search-deepseek',
+		'dsh-search-chain': '^2.0.0',
+		'dsh-search-deepseek': '^1.0.0',
 	})
 })
 
-await test('两个行包都不声明任何依赖（host 侧零 @deepseek-ai import）', () => {
+await test('两个行包只依赖 bundle 包，且不依赖任何 @deepseek-ai 包（host 侧零 @deepseek-ai 依赖）', () => {
 	for (const rel of ['row-chain/package.json', 'row-deepseek/package.json']) {
 		const pkg = readJson(rel)
-		assert.equal(pkg.dependencies, undefined, rel)
+		// 发布形态：行包必须声明 bundle 包依赖，否则"按包名 re-export"在 pnpm 下解析不到。
+		assert.deepEqual(Object.keys(pkg.dependencies ?? {}), ['dsh-websearch-tavily-keys-select'], rel)
+		assert.equal(Object.keys(pkg.dependencies ?? {}).some((name) => name.startsWith('@deepseek-ai/')), false, rel)
 	}
 })
 
 await test('host 半边不出现任何 @deepseek-ai 静态 import（只有官方兜底那次懒动态 import）', () => {
-	const code = read('host/index-v5.mjs')
+	const code = read('bundle/host/index-v5.mjs')
 	assert.equal(/^import .*@deepseek-ai/m.test(code), false, '静态 import 不许引 @deepseek-ai')
 	assert.ok(code.includes("await import('@deepseek-ai/dsh-web-search-deepseek')"))
 })

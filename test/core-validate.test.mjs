@@ -1,5 +1,5 @@
 import { test, summary, assert } from './harness.mjs'
-import { MAX_SOURCES, defaultDocument, emptyDocument, validateSubmission, nextIdIn, nextRefIn } from '../host/core.mjs'
+import { MAX_SOURCES, defaultDocument, emptyDocument, validateSubmission, nextIdIn, nextRefIn } from '../bundle/host/core.mjs'
 
 console.log('-- core: 提交校验 --')
 

@@ -1,14 +1,14 @@
 import { readFileSync } from 'node:fs'
 import { test, summary, assert, tempDir, cleanup, makeFakeCtx, makeFakeCredentials, makeFakeConnection } from './harness.mjs'
-import { writeConfigDocument } from '../host/config-store.mjs'
+import { writeConfigDocument } from '../bundle/host/config-store.mjs'
 
 // ⚠️ 必须在 import index-v5 之前把 DSH_HOME 指到临时目录：
 // 审计日志 `web-search-chain.log` 与配置文档都由它派生，绝不能碰真的 ~\.dsh。
 const dir = tempDir('chain-provider')
 process.env.DSH_HOME = dir
 
-const { apply, ChainSearchProvider, normalizeChain, configPath, __resetFallbackRegistryForTests } = await import('../host/index-v5.mjs')
-const { emptyDocument, orderedLegs } = await import('../host/core.mjs')
+const { apply, ChainSearchProvider, normalizeChain, configPath, __resetFallbackRegistryForTests } = await import('../bundle/host/index-v5.mjs')
+const { emptyDocument, orderedLegs } = await import('../bundle/host/core.mjs')
 
 // 模块级兜底注册表在同一进程里被别的测试文件挂过 ⇒ 先清空，保证本文件的断言与顺序无关
 // （本文件跑在 run-all 的最前面，但别把"字母序"当成隔离手段）。

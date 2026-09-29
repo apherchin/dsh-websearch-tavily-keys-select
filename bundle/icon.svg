@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Web search chain">
+  <rect width="64" height="64" rx="14" fill="#0b7285"/>
+  <g fill="none" stroke="#ffffff" stroke-width="3.4" stroke-linecap="round">
+    <circle cx="27" cy="27" r="13"/>
+    <path d="M36.9 36.9 52 52"/>
+    <path d="M20 22h14"/>
+    <path d="M20 27h14"/>
+    <path d="M20 32h9"/>
+  </g>
+</svg>

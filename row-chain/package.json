@@ -1,19 +1,52 @@
 {
   "name": "dsh-search-chain",
   "version": "2.0.0",
-  "private": true,
   "type": "module",
   "main": "index.mjs",
-  "description": "链本体：注册 web_search 的 provider，并供应配置卡片；请勿关闭",
+  "description": "链本体：注册 web_search 的 provider 并供应配置卡片。由 dsh-websearch-tavily-keys-select 依赖，通常无需单独安装。",
+  "publishConfig": {
+    "access": "public"
+  },
   "exports": {
     ".": "./index.mjs",
     "./client": "./client.js",
     "./package.json": "./package.json"
   },
+  "files": [
+    "index.mjs",
+    "client.js",
+    "locale/*.json"
+  ],
   "dsh": {
     "client": {
       "inject": [],
       "platform": "web"
     }
+  },
+  "dependencies": {
+    "dsh-websearch-tavily-keys-select": "^2.0.0"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "dsh-plugin",
+    "web-search"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "apherchin"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/apherchin/dsh-websearch-tavily-keys-select.git",
+    "directory": "row-chain"
+  },
+  "bugs": {
+    "url": "https://github.com/apherchin/dsh-websearch-tavily-keys-select/issues"
+  },
+  "homepage": "https://github.com/apherchin/dsh-websearch-tavily-keys-select#readme",
+  "engines": {
+    "node": ">=20"
   }
 }

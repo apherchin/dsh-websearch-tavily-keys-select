@@ -148,7 +148,11 @@ exports.apply(makeCtx())
 check('注册进 plugins.bundle.config', registrations.length === 1 && registrations[0].slot === 'plugins.bundle.config', JSON.stringify(registrations.map((r) => r.slot)))
 const reg = registrations[0]
 check('注册 name = plugins.bundle.config', reg?.spec?.name === 'plugins.bundle.config', reg?.spec?.name)
-check('注册 key = dsh-web-search-chain（包名逐字，否则包页不渲染）', reg?.spec?.key === 'dsh-web-search-chain', reg?.spec?.key)
+// ⚠️ 必须与 **bundle 包的 name 动态比对**，不能写死字面量：
+//    宿主侧判据是 `configured = ledger.bundles.has(pkg.name)` ⇒ "改包名忘了改 ENTRY_KEY"
+//    会让整块配置卡片不渲染（与 2026-09-29 那次 client bundle id 事故同型）。
+const BUNDLE_NAME = JSON.parse(fs.readFileSync(join(dirname(CLIENT), '..', 'bundle', 'package.json'), 'utf8')).name
+check(`注册 key = bundle 包名（逐字，否则包页不渲染；当前 ${BUNDLE_NAME}）`, reg?.spec?.key === BUNDLE_NAME, reg?.spec?.key)
 check('注册 Comp 是函数', typeof reg?.Comp === 'function')
 check('注册用了 inject 面（hooks + 4 个动作）', (() => {
 	const face = reg?.spec?.inject?.()

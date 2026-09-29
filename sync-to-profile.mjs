@@ -21,8 +21,8 @@ const PROFILE_NODE_MODULES = join(process.env.USERPROFILE ?? '', '.dsh', 'profil
 
 /** 正本子目录 → profile 里的包目录。 */
 const MAPPING = [
-	{ from: 'bundle', to: 'dsh-web-search-chain' },
-	{ from: 'host', to: 'dsh-web-search-chain' },
+	// bundle 包已**自包含**（host/ 在包内）：npm 包不能引用 `../host`，所以正本也按包的实际形态组织。
+	{ from: 'bundle', to: 'dsh-websearch-tavily-keys-select' },
 	{ from: 'row-chain', to: 'dsh-search-chain' },
 	{ from: 'row-deepseek', to: 'dsh-search-deepseek' },
 ]

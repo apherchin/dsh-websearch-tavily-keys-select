@@ -1,8 +1,8 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test, summary, assert, tempDir, cleanup } from './harness.mjs'
-import { configDocumentPath, readConfigDocument, writeConfigDocument } from '../host/config-store.mjs'
-import { defaultDocument, MAX_DOCUMENT_BYTES } from '../host/core.mjs'
+import { configDocumentPath, readConfigDocument, writeConfigDocument } from '../bundle/host/config-store.mjs'
+import { defaultDocument, MAX_DOCUMENT_BYTES } from '../bundle/host/core.mjs'
 
 console.log('-- config-store: 读写与降级 --')
 

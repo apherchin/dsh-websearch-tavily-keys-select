@@ -1,8 +1,9 @@
 /**
- * 配置卡片（浏览器半边）：侧栏 Plugins → dsh-web-search-chain 包页上的那张表单。
+ * 配置卡片（浏览器半边）：侧栏 Plugins → dsh-websearch-tavily-keys-select 包页上的那张表单。
  *
- * 注册进 `plugins.bundle.config`，键 = 包名 `dsh-web-search-chain`（宿主侧
- * `configured = ledger.bundles.has(pkg.name)` 用的就是这个名字，写错一个字符整块不渲染）。
+ * 注册进 `plugins.bundle.config`，键 = **bundle 包的包名** `dsh-websearch-tavily-keys-select`
+ * （宿主侧 `configured = ledger.bundles.has(pkg.name)` 用的就是这个名字，写错一个字符整块不渲染；
+ * 改包名时必须同步改这里的 `ENTRY_KEY`，`test/verify-client.mjs` 有动态守卫）。
  *
  * ⚠️ 三条硬约束：
  * 1. **只 require 基座**（react / react/jsx-runtime）。官方 practices 明文禁止 client 半边
@@ -27,7 +28,7 @@ window.__ModuleLoader__.load({
 
 		const CONFIG_PATH = "/api/web-search-chain.config";
 		const SLOT = "plugins.bundle.config";
-		const ENTRY_KEY = "dsh-web-search-chain";
+		const ENTRY_KEY = "dsh-websearch-tavily-keys-select";
 		const MAX_SOURCES = 3;
 		const REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 

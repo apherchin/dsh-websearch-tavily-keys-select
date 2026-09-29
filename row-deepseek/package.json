@@ -1,8 +1,44 @@
 {
   "name": "dsh-search-deepseek",
   "version": "1.0.0",
-  "private": true,
   "type": "module",
   "main": "index.mjs",
-  "description": "官方 DeepSeek 搜索兜底（两个 KEY 都不可用时使用，会花官方余额）"
+  "description": "官方 DeepSeek 搜索兜底：Tavily 源全部失败或未配置时使用（会花官方余额）。由 dsh-websearch-tavily-keys-select 依赖，通常无需单独安装。",
+  "publishConfig": {
+    "access": "public"
+  },
+  "exports": {
+    ".": "./index.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.mjs",
+    "locale/*.json"
+  ],
+  "dependencies": {
+    "dsh-websearch-tavily-keys-select": "^2.0.0"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "dsh-plugin",
+    "web-search"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "apherchin"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/apherchin/dsh-websearch-tavily-keys-select.git",
+    "directory": "row-deepseek"
+  },
+  "bugs": {
+    "url": "https://github.com/apherchin/dsh-websearch-tavily-keys-select/issues"
+  },
+  "homepage": "https://github.com/apherchin/dsh-websearch-tavily-keys-select#readme",
+  "engines": {
+    "node": ">=20"
+  }
 }

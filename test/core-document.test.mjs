@@ -1,5 +1,5 @@
 import { test, summary, assert } from './harness.mjs'
-import { defaultDocument, emptyDocument, parseDocumentText, serializeDocument, MAX_DOCUMENT_BYTES, MAX_SOURCES } from '../host/core.mjs'
+import { defaultDocument, emptyDocument, parseDocumentText, serializeDocument, MAX_DOCUMENT_BYTES, MAX_SOURCES } from '../bundle/host/core.mjs'
 
 console.log('-- core: 配置文档 --')
 

@@ -1,17 +1,57 @@
 {
-  "name": "dsh-web-search-chain",
+  "name": "dsh-websearch-tavily-keys-select",
   "version": "2.0.0",
-  "private": true,
   "type": "module",
-  "main": "index-v5.mjs",
-  "description": "Web 搜索链路：Tavily（0~3 个源，环境变量或明文密钥）→ 官方 DeepSeek 搜索兜底；配置界面在侧栏 Plugins 的本包页面",
+  "main": "./host/index-v5.mjs",
+  "icon": "./icon.svg",
+  "description": "DSH 的 Web 搜索链路：按顺序尝试最多 3 个 Tavily 源（Windows 环境变量或明文密钥）→ 全部失败时交给官方 DeepSeek 搜索兜底；配置卡片在侧栏 Plugins 的本包页面。",
+  "publishConfig": {
+    "access": "public"
+  },
+  "exports": {
+    ".": "./host/index-v5.mjs",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "host/*.mjs",
+    "cordis.patch.yml",
+    "icon.svg",
+    "assets/*"
+  ],
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
   },
   "dependencies": {
-    "dsh-search-chain": "file:../dsh-search-chain",
-    "dsh-search-deepseek": "file:../dsh-search-deepseek"
+    "dsh-search-chain": "^2.0.0",
+    "dsh-search-deepseek": "^1.0.0"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "dsh-plugin",
+    "plugin",
+    "web-search",
+    "search",
+    "tavily"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "apherchin"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/apherchin/dsh-websearch-tavily-keys-select.git",
+    "directory": "bundle"
+  },
+  "bugs": {
+    "url": "https://github.com/apherchin/dsh-websearch-tavily-keys-select/issues"
+  },
+  "homepage": "https://github.com/apherchin/dsh-websearch-tavily-keys-select#readme",
+  "engines": {
+    "node": ">=20"
   }
 }

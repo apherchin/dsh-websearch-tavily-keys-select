@@ -1,5 +1,5 @@
 import { test, summary, assert } from './harness.mjs'
-import { orderedLegs, unusedRefs, describeAttempts, LITERAL_REF_PREFIX } from '../host/core.mjs'
+import { orderedLegs, unusedRefs, describeAttempts, LITERAL_REF_PREFIX } from '../bundle/host/core.mjs'
 
 console.log('-- core: 腿序 / 凭据回收 / 失败文案 --')
 

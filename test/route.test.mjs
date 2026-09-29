@@ -6,9 +6,9 @@ import { test, summary, assert, tempDir, cleanup, makeFakeCtx, makeFakeCredentia
 const dir = tempDir('route')
 process.env.DSH_HOME = dir
 
-const { CONFIG_PATH, apply, routeFetch, readState, configPath, __resetFallbackRegistryForTests } = await import('../host/index-v5.mjs')
-const { readConfigDocument, writeConfigDocument } = await import('../host/config-store.mjs')
-const { MAX_SOURCES } = await import('../host/core.mjs')
+const { CONFIG_PATH, apply, routeFetch, readState, configPath, __resetFallbackRegistryForTests } = await import('../bundle/host/index-v5.mjs')
+const { readConfigDocument, writeConfigDocument } = await import('../bundle/host/config-store.mjs')
+const { MAX_SOURCES } = await import('../bundle/host/core.mjs')
 
 // 模块级兜底注册表在同一进程里被别的测试文件挂过 ⇒ 先清空，保证本文件的断言与顺序无关。
 __resetFallbackRegistryForTests()
