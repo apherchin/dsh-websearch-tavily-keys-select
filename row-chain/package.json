@@ -1,0 +1,19 @@
+{
+  "name": "dsh-search-chain",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "main": "index.mjs",
+  "description": "链本体：注册 web_search 的 provider，并供应配置卡片；请勿关闭",
+  "exports": {
+    ".": "./index.mjs",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "inject": [],
+      "platform": "web"
+    }
+  }
+}

@@ -1,0 +1,6 @@
+.tmp/
+node_modules/
+*.log
+*.tgz
+_cache/
+

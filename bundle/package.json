@@ -1,0 +1,17 @@
+{
+  "name": "dsh-web-search-chain",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "main": "index-v5.mjs",
+  "description": "Web 搜索链路：Tavily（0~3 个源，环境变量或明文密钥）→ 官方 DeepSeek 搜索兜底；配置界面在侧栏 Plugins 的本包页面",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "dsh-search-chain": "file:../dsh-search-chain",
+    "dsh-search-deepseek": "file:../dsh-search-deepseek"
+  }
+}

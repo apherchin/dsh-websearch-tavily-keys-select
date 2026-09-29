@@ -1,0 +1,36 @@
+# Layer owned by the `dsh-web-search-chain` bundle.
+#
+# 2026-09-29 起 Tavily 源**不再是 loader 行**：源列表（0~3 个）由插件自己的配置文档
+# `$DSH_HOME\web-search-chain.json` 决定，侧栏 Plugins → dsh-web-search-chain 包页的配置卡片
+# 是唯一真源。这里只剩两行：
+#   web-search-source-deepseek  官方搜索兜底；同时是**花钱总开关**（关掉就不花官方钱）
+#   web-search-chain            链本体：注册 `ctx.web` 选中的 provider + 提供配置路由
+#
+# ⚠️ 改本文件后：`node sync-to-profile.mjs --apply` → **整机重启** DSH。
+- insert:
+    - id: web-search-source-deepseek
+      name: "dsh-search-deepseek"
+      config:
+        role: source
+        slot: deepseek
+        kind: deepseek
+        keyRef: DEEPSEEK_API_KEY
+
+    # 链本体：注册 ctx.web 选中的那个 provider；共享传输设置都放在这一行
+    - id: web-search-chain
+      name: "dsh-search-chain"
+      config:
+        role: chain
+        id: tavily-chain
+        tavily:
+          baseURL: https://api.tavily.com
+          searchDepth: basic          # basic=1 credit；advanced=2 credits
+          maxResults: 10
+          topic: general
+          includePublishedDate: false
+          timeoutMs: 30000
+        deepseek:
+          baseURL: https://api.deepseek.com/anthropic/v1
+          model: deepseek-v4-flash
+          maxTokens: 4096
+          maxUses: 5
