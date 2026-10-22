@@ -111,6 +111,20 @@ const MUTANTS = [
 		replace: 'const at = -1',
 		test: 'test/chain-provider.test.mjs',
 	},
+	{
+		name: 'M13 query 里的 site: 不翻译成 Site 参数（等于又把站点约束丢掉）',
+		file: 'bundle/host/index-v5.mjs',
+		find: 'const site = settings.site ?? intent.site',
+		replace: 'const site = settings.site',
+		test: 'test/chain-provider.test.mjs',
+	},
+	{
+		name: 'M14 query 里的时间词不翻译成 Freshness（时效约束丢失，会拿到旧闻）',
+		file: 'bundle/host/index-v5.mjs',
+		find: 'const freshness = settings.freshness ?? intent.freshness',
+		replace: 'const freshness = settings.freshness',
+		test: 'test/chain-provider.test.mjs',
+	},
 ]
 
 /** 复制正本（跳过 .tmp），返回副本根目录。 */

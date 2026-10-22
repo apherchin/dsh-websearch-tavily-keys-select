@@ -208,6 +208,94 @@ export function sanitizeUrl(value) {
 	return `${raw.slice(0, schemeEnd + 3)}${authority.slice(at + 1)}${raw.slice(authorityEnd)}`
 }
 
+/**
+ * 从**查询文本**里解析元宝搜索的两个真参数（`Freshness` / `Site`）。
+ *
+ * 为什么要"翻译"而不是加界面（2026-10-22 用户决定）：`web_search` 只接受 `{queries}`，
+ * 模型没法传额外字段；而用户也不会为每次搜索手填时间窗。所以约定：
+ * **模型在 query 里用自然写法表达意图，插件翻译成接口参数**。
+ *
+ * 约定（已写进 AGENTS.md 与 README）：
+ * - `site:www.gov.cn`、`site:a.com,b.com` ⇒ `Site` 参数，并从 Query 里**删掉**这个记号
+ *   （元宝把 `site:` 当普通词，不删既浪费召回又会让结果变脏）；
+ * - 时间词 ⇒ `Freshness`：`今天/刚刚` → `d1`、`昨天` → `d2`、`本周/最近7天` → `d7`、
+ *   `本月/最近30天` → `m1`、`最近3个月` → `m3`、`今年/近一年` → `y1`；
+ * - 显式日期（`2026年10月21日` / `2026-10-21`）按**距今多少天**折算成 `d2/d7/m1/m3/y1`；
+ * - 纯"最新/latest"这类**不**触发（会误伤官网资料页这类长期有效的结果）。
+ *
+ * 配置里显式写了 `yuanbao.freshness` / `yuanbao.site` 时以配置为准（见 searchYuanbao）。
+ *
+ * @param query - 调用方给的原始查询。
+ * @param nowMs - 当前毫秒时间戳（测试注入，保证可复现）。
+ * @returns `{query, site, freshness}`：`query` 是**删掉 site: 记号后**的文本。
+ */
+export function parseSearchIntent(query, nowMs) {
+	const original = typeof query === 'string' ? query : ''
+	let text = original
+	// 1) site: 记号（逗号分隔多个域名）→ Site 参数
+	const sites = []
+	const sitePattern = /\bsite:([a-z0-9][a-z0-9.-]*\.[a-z]{2,}(?:\s*,\s*[a-z0-9][a-z0-9.-]*\.[a-z]{2,})*)/gi
+	text = text.replace(sitePattern, (_match, domains) => {
+		for (const domain of String(domains).split(',')) {
+			const clean = domain.trim().toLowerCase().replace(/\.$/u, '')
+			if (clean.length > 0 && !sites.includes(clean)) sites.push(clean)
+		}
+		return ' '
+	})
+	const site = sites.length === 0 ? undefined : sites.join(',')
+
+	// 2) 时间词 → Freshness（先具体后宽泛；命中即止）
+	const hints = [
+		{ pattern: /刚刚|刚才|此刻|实时|现在|今天|今日|today|\bjust now\b/i, freshness: 'd1' },
+		{ pattern: /昨天|昨日|yesterday/i, freshness: 'd2' },
+		{ pattern: /前天/i, freshness: 'd3' },
+		{ pattern: /本周|这周|这个星期|近一周|最近一周|最近\s*7\s*天|近\s*7\s*天|过去一周|this week/i, freshness: 'd7' },
+		{ pattern: /本月|这个月|近一个月|最近一个月|最近\s*30\s*天|过去一个月|this month/i, freshness: 'm1' },
+		{ pattern: /近三个月|最近三个月|最近\s*3\s*个月/i, freshness: 'm3' },
+		{ pattern: /今年|本年度|今年以来|近一年|最近一年|过去一年|this year/i, freshness: 'y1' },
+	]
+	let freshness
+	for (const hint of hints) {
+		if (hint.pattern.test(text)) {
+			freshness = hint.freshness
+			break
+		}
+	}
+	// 3) 「最近 N 天 / N 个月」这种带数字的写法
+	if (freshness === undefined) {
+		const days = /最近\s*(\d{1,2})\s*天|近\s*(\d{1,2})\s*天|last\s*(\d{1,2})\s*days?/i.exec(text)
+		if (days !== null) {
+			const count = Number(days[1] ?? days[2] ?? days[3])
+			if (Number.isInteger(count) && count >= 1 && count <= 30) freshness = `d${count}`
+		}
+	}
+	if (freshness === undefined) {
+		const months = /最近\s*(\d{1,2})\s*个月|近\s*(\d{1,2})\s*个月|last\s*(\d{1,2})\s*months?/i.exec(text)
+		if (months !== null) {
+			const count = Number(months[1] ?? months[2] ?? months[3])
+			if (Number.isInteger(count) && count >= 1 && count <= 12) freshness = `m${count}`
+		}
+	}
+	// 4) 显式日期：按距今天数折算（`Freshness` 只有相对窗口，没有绝对区间）
+	if (freshness === undefined) {
+		const explicit = /(20\d{2})\s*[年\-/.]\s*(\d{1,2})\s*[月\-/.]\s*(\d{1,2})/u.exec(text)
+		if (explicit !== null) {
+			const at = Date.UTC(Number(explicit[1]), Number(explicit[2]) - 1, Number(explicit[3]))
+			if (Number.isFinite(at)) {
+				const daysAgo = Math.floor((Number(nowMs) - at) / 86_400_000)
+				if (daysAgo >= 0) {
+					if (daysAgo <= 1) freshness = 'd2'
+					else if (daysAgo <= 7) freshness = 'd7'
+					else if (daysAgo <= 31) freshness = 'm1'
+					else if (daysAgo <= 92) freshness = 'm3'
+					else if (daysAgo <= 366) freshness = 'y1'
+				}
+			}
+		}
+	}
+	return { query: text.replace(/\s+/gu, ' ').trim(), site, freshness }
+}
+
 /** 把可选整数字段夹到合理范围，不可用时回退。 */
 function clampInteger(value, min, max, fallback) {
 	return Number.isInteger(value) && value >= min && value <= max ? value : fallback
@@ -268,7 +356,10 @@ export function normalizeChain(config) {
 			mode: YUANBAO_MODES.includes(yuanbao.mode) ? yuanbao.mode : undefined,
 			cnt: YUANBAO_COUNTS.includes(yuanbao.cnt) ? yuanbao.cnt : undefined,
 			industry: YUANBAO_INDUSTRIES.includes(yuanbao.industry) ? yuanbao.industry : undefined,
+			// 配置里写死就**强制**用这个时效；不写 = 按 query 里的时间词自动判定（见 parseSearchIntent）
 			freshness: optionalString(yuanbao.freshness),
+			// 配置里写死就强制只用这些域名（逗号分隔）；不写 = 从 query 的 `site:` 记号里解析
+			site: optionalString(yuanbao.site),
 			timeoutMs: clampInteger(yuanbao.timeoutMs, 1, 600000, 30000),
 		},
 	}
@@ -653,6 +744,8 @@ export class ChainSearchProvider {
 						apiVersion: result.version,
 						requestId: result.requestId,
 						used,
+						...(result.freshness === undefined ? {} : { freshness: result.freshness }),
+						...(result.site === undefined ? {} : { site: result.site }),
 						budget: { monthly: status.monthly, reserve: status.reserve },
 						priorAttempts: attempts,
 					})
@@ -845,12 +938,17 @@ export class ChainSearchProvider {
 	async searchYuanbao(config, credentials, request, signal) {
 		const settings = config.yuanbao
 		const endpoint = `${settings.baseURL}/`
-		const body = { Query: request.query }
+		// 把 query 里的 `site:` 记号与时间词翻译成真参数；配置里写死时以配置为准
+		const intent = parseSearchIntent(request.query, this.now())
+		const body = { Query: intent.query }
 		const cnt = this.yuanbaoCount(settings, request)
 		if (cnt !== undefined) body.Cnt = cnt
 		if (settings.mode !== undefined) body.Mode = settings.mode
 		if (settings.industry !== undefined) body.Industry = settings.industry
-		if (settings.freshness !== undefined) body.Freshness = settings.freshness
+		const freshness = settings.freshness ?? intent.freshness
+		if (freshness !== undefined) body.Freshness = freshness
+		const site = settings.site ?? intent.site
+		if (site !== undefined) body.Site = site
 		const payload = JSON.stringify(body)
 		const timestamp = Math.floor(this.now() / 1000)
 		const { authorization } = buildTc3Authorization({
@@ -897,6 +995,9 @@ export class ChainSearchProvider {
 				sources: Number.isInteger(limit) && limit > 0 ? sources.slice(0, limit) : sources,
 				version: optionalString(envelope.Version),
 				requestId: optionalString(envelope.RequestId),
+				// 审计用：这次到底给上游发了什么时效/域名约束（不写就无从核对"为什么结果变了"）
+				freshness,
+				site,
 			}
 		} catch (error) {
 			if (signal?.aborted === true) throw error

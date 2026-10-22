@@ -220,7 +220,7 @@ const { usagePath, runtimePath } = await import('../bundle/host/index-v5.mjs')
 const { writeRuntimeState, readRuntimeState, readConfigDocument } = await import('../bundle/host/config-store.mjs')
 const { writeUsageDocument } = await import('../bundle/host/config-store.mjs')
 const { beijingMonthKey } = await import('../bundle/host/core.mjs')
-const { mapYuanbaoPages, mapTavilySources, mapDeepseekApiSources, sanitizeUrl } = await import('../bundle/host/index-v5.mjs')
+const { mapYuanbaoPages, mapTavilySources, mapDeepseekApiSources, sanitizeUrl, parseSearchIntent } = await import('../bundle/host/index-v5.mjs')
 
 const SECRET_KEY_REF = 'TENCENTCLOUD_SECRET_KEY'
 const SECRET_ID = 'AKIDtestSecretId0000000000000000'
@@ -264,7 +264,8 @@ await test('yuanbao 腿：签名头/请求体/结果映射都成立', async () =
 		assert.equal(seen.init.headers['x-tc-version'], '2025-05-08')
 		assert.equal(seen.init.headers['content-type'], 'application/json; charset=utf-8')
 		assert.match(seen.init.headers.authorization, /^TC3-HMAC-SHA256 Credential=AKIDtestSecretId0000000000000000\/\d{4}-\d{2}-\d{2}\/wsa\/tc3_request, SignedHeaders=content-type;host;x-tc-action, Signature=[0-9a-f]{64}$/u)
-		assert.deepEqual(JSON.parse(seen.init.body), { Query: '今天北京的天气', Cnt: 10 })
+		// "今天…" 会被意图解析补上 Freshness=d1（2026-10-22 起的约定）
+		assert.deepEqual(JSON.parse(seen.init.body), { Query: '今天北京的天气', Cnt: 10, Freshness: 'd1' })
 		assert.deepEqual(result.sources, [
 			{ url: 'https://a.example/1', title: '标题一', snippet: '标准摘要', publishedAt: '2026/10/22 09:00:00' },
 			{ url: 'https://a.example/2', title: '无 passage', snippet: '只有动态摘要' },
@@ -394,6 +395,72 @@ await test('★结果 URL 规整：剥掉 userinfo（防伪冒域名/像泄漏�
 	assert.deepEqual(mapTavilySources({ results: [{ url: 'http://u:p@a.example/1', title: 't' }] }), [{ url: 'http://a.example/1', title: 't' }])
 	assert.deepEqual(mapDeepseekApiSources({ results: [{ url: 'http://u:p@b.example/2' }] }), [{ url: 'http://b.example/2' }])
 })
+
+//#region query 意图 → Freshness / Site（2026-10-22 文章实测后的约定）
+await test('parseSearchIntent：site: 记号 → Site 参数并从 Query 里删掉', () => {
+	const base = Date.UTC(2026, 9, 22)
+	assert.deepEqual(parseSearchIntent('site:www.gov.cn 人工智能+ 行动意见', base), { query: '人工智能+ 行动意见', site: 'www.gov.cn', freshness: undefined })
+	assert.deepEqual(parseSearchIntent('site:a.example,b.example 价格', base).site, 'a.example,b.example')
+	assert.deepEqual(parseSearchIntent('没有站点的普通查询', base), { query: '没有站点的普通查询', site: undefined, freshness: undefined })
+	// 非法域名（无点号）不认，原样留在 query 里
+	assert.equal(parseSearchIntent('site:localhost 测试', base).site, undefined)
+})
+
+await test('parseSearchIntent：时间词 → Freshness 窗口（含最近 N 天 / 显式日期）', () => {
+	const base = Date.UTC(2026, 9, 22, 6, 0, 0)
+	const cases = [
+		['今天的 A股 收盘', 'd1'],
+		['昨天 上证指数', 'd2'],
+		['本周 AI 融资', 'd7'],
+		['最近 7 天 的 发布会', 'd7'],
+		['最近3天 的 消息', 'd3'],
+		['本月 新能源 销量', 'm1'],
+		['最近 3 个月 的 融资', 'm3'],
+		['今年 的 政策', 'y1'],
+		['2026年10月21日 A股 收盘', 'd2'], // 距今 1 天
+		['2026-10-18 的新闻', 'd7'], // 距今 4 天
+		['2026年8月1日 的公告', 'm3'], // 距今 82 天
+	]
+	for (const [query, expected] of cases) {
+		assert.equal(parseSearchIntent(query, base).freshness, expected, query)
+	}
+	// "最新/latest" 这类宽泛词**不**触发（会误伤官网资料页）
+	assert.equal(parseSearchIntent('Latest DeepSeek model release', base).freshness, undefined)
+	assert.equal(parseSearchIntent('最新版本 说明', base).freshness, undefined)
+})
+
+await test('★元宝腿：query 里的意图真的进到了请求体（Site / Freshness），审计也记下来', async () => {
+	const credentials = makeFakeCredentials({ values: { [SECRET_KEY_REF]: 'sk-test' } })
+	const { provider } = mountChain({ credentials })
+	resetUsage()
+	setDoc([yuanbaoSource()])
+	let seen
+	stubFetch(async (url, init) => {
+		seen = JSON.parse(init.body)
+		return yuanbaoOk([{ url: 'https://a.example/1' }])
+	})
+	try {
+		await provider.search({ query: 'site:www.gov.cn 今天的 人工智能+ 行动意见' }, undefined)
+		assert.equal(seen.Site, 'www.gov.cn')
+		assert.equal(seen.Freshness, 'd1')
+		assert.equal(seen.Query, '今天的 人工智能+ 行动意见', 'Query 里不许再带 site: 记号')
+		const log = readFileSync(`${dir}\\web-search-chain.log`, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+		const served = log.filter((entry) => entry.outcome === 'served' && entry.target === 'yuanbao').at(-1)
+		assert.equal(served.site, 'www.gov.cn')
+		assert.equal(served.freshness, 'd1')
+
+		// 配置里写死时以配置为准（自动判定让位）
+		const { provider: overrideProvider } = mountChain({ credentials, chain: { yuanbao: { freshness: 'd7', site: 'a.example' } } })
+		resetUsage()
+		setDoc([yuanbaoSource()])
+		await overrideProvider.search({ query: '今天的 话题 site:b.example' }, undefined)
+		assert.equal(seen.Freshness, 'd7')
+		assert.equal(seen.Site, 'a.example')
+	} finally {
+		stubFetch(realFetch)
+	}
+})
+//#endregion
 
 await test('yuanbao 缺 SecretId ⇒ 记 credential-missing，不发请求', async () => {
 	const credentials = makeFakeCredentials({ values: { [SECRET_KEY_REF]: 'sk-test' } })

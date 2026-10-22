@@ -92,7 +92,8 @@ dsh plugin --profile <你的 profile> add dsh-websearch-tavily-keys-select
 | 源 | 必填 | 说明 |
 |---|---|---|
 | 腾讯元宝搜索 | **SecretId** + SecretKey（环境变量名或明文）+ 可选额度 | SecretId 明文存在配置文档里（可随时改）；SecretKey 默认读 `TENCENTCLOUD_SECRET_KEY` |
-| DeepSeek 搜索 API | key（环境变量名或明文） | `DEEPSEEK_API_KEY`（5 元/千次，成功才计费） |\n| Tavily | key（环境变量名或明文） | `TAVILY_API_KEY1` / `TAVILY_API_KEY2` 之类 |
+| DeepSeek 搜索 API | key（环境变量名或明文） | `DEEPSEEK_API_KEY`（5 元/千次，成功才计费） |
+| Tavily | key（环境变量名或明文） | `TAVILY_API_KEY1` / `TAVILY_API_KEY2` 之类 |
 
 - **源的顺序 = 尝试顺序**；最多 **4 个**源；每个源失败自动降级到下一个。
 - **官方兜底**：页面里 `DS_OFFICIAL` 那个开关。本机 2026-10-22 起**已关掉**（改用 DS 搜索 API 兜底）——关掉就不花官方余额。
@@ -100,6 +101,26 @@ dsh plugin --profile <你的 profile> add dsh-websearch-tavily-keys-select
 - **自动停用**：某源**连续 3 次确定性失败**（鉴权失败 / 套餐超限 / 404 这类"不修就一直失败"的错误）后，宿主自动把它摘出链路，卡片上显示原因与「恢复」按钮；超时、429、5xx 属于暂时性失败，**不累计**。
 - 保存后**立即生效**（下一次搜索就用新配置），无需重启。
 - 环境变量是 DSH **启动时**快照的：新加/改完 `TENCENTCLOUD_SECRET_KEY` 要**重启 DSH** 才生效。
+
+### query 里怎么写「时效」和「站点」
+
+`web_search` 只接受 `{queries}`，没有额外参数字段；但你**不用记参数**——直接在查询里用自然写法，插件会翻译成元宝的真参数：
+
+| 你写的 | 插件实际发 |
+|---|---|
+| `site:www.gov.cn 人工智能+ 行动意见` | `Site="www.gov.cn"`，并把 `site:` 记号从 Query 里删掉 |
+| `site:a.com,b.com 价格` | `Site="a.com,b.com"` |
+| `今天/刚刚 …` | `Freshness="d1"` |
+| `昨天 …` | `Freshness="d2"` |
+| `本周/最近7天 …` / `最近3天 …` | `Freshness="d7"` / `"d3"` |
+| `本月 …` / `最近3个月 …` / `今年 …` | `Freshness="m1"` / `"m3"` / `"y1"` |
+| `2026年10月21日 …`（显式日期） | 按距今天数折算成 `d2/d7/m1/m3/y1` |
+
+- **为什么必须这样**：元宝把 `site:` 当普通词（实测 `site:github.com` 完全不生效），而 `Freshness` 是独立参数。
+- **`最新/latest` 不触发**：这类宽泛词会误伤官网资料页（它们没有日期）；实测 `Latest DeepSeek model release` 不传更稳。
+- **实测收益**：问「2026年10月21日 A股 收盘」不传 Freshness 时 10 条全是 **2025 年同日旧闻**；加了 `d2` 后 10/10 是当日新闻。
+- **覆盖**：链行配置里写 `yuanbao.freshness` / `yuanbao.site` 会**强制**用配置值（压过自动判定），适合"只想搜某站"的专用实例。
+- `Site` 只对自然结果生效（`Mode=1` 的垂直卡片不吃它）；实测黑名单语法 `-host` 返回 **0 条**，暂不支持。
 
 ### 配置存在哪 / 怎么排查
 
@@ -122,9 +143,9 @@ dsh plugin --profile <你的 profile> add dsh-websearch-tavily-keys-select
 ### 测试（离线，任意 cwd）
 
 ```powershell
-node test\run-all.mjs         # 9 个测试文件 / 160 条（含 manifest 11、route 35、core-budget 14、tencent-sign 9）
+node test\run-all.mjs         # 9 个测试文件 / 167 条（含 manifest 11、route 35、core-budget 14、tencent-sign 9）
 node test\verify-client.mjs   # 客户端验证台：80/80（含合规守卫、注册 key 动态比对）
-node test\make-mutants.mjs    # 变异测试：11/11 必须被杀（含"拆掉额度闸门""月份键改 UTC""签名不做小写""停用的源照样被搜"）
+node test\make-mutants.mjs    # 变异测试：14/14 必须被杀（含"拆掉额度闸门""月份键改 UTC""签名不做小写""停用的源照样被搜"）
 ```
 
 > ⚠️ 别用 `node --test`：本机沙箱禁命名管道，runner 会 spawn EPERM 并给出误导性的 `# fail 1`。
