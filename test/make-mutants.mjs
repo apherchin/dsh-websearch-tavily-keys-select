@@ -59,6 +59,43 @@ const MUTANTS = [
 		replace: 'ctx.inject([], (connectionCtx) => {',
 		test: 'test/route.test.mjs',
 	},
+	{
+		// 额度闸门是本插件唯一"能替用户省钱"的东西：闸门失效 ⇒ 超额按 20 元/千次计费。
+		name: 'M6 拆掉额度闸门（超额照发，会真花钱）',
+		file: 'bundle/host/index-v5.mjs',
+		find: 'if (status.exhausted) {',
+		replace: 'if (false) {',
+		test: 'test/chain-provider.test.mjs',
+	},
+	{
+		name: 'M7 把「保留余量」漏掉（可用额度 = 全额，撞线风险）',
+		file: 'bundle/host/core.mjs',
+		find: 'const usable = Math.max(0, monthly - reserve)',
+		replace: 'const usable = monthly',
+		test: 'test/core-budget.test.mjs',
+	},
+	{
+		name: 'M8 不校验 SecretId（yuanbao 源能存成死源）',
+		file: 'bundle/host/core.mjs',
+		find: "if (!SECRET_ID_PATTERN.test(secretId)) {\n\t\t\t\treturn failure('INVALID_SECRET_ID'",
+		replace: "if (false) {\n\t\t\t\treturn failure('INVALID_SECRET_ID'",
+		test: 'test/core-validate.test.mjs',
+	},
+	{
+		// 北京时间切月：写成 UTC 会把每月最后 8 小时的调用算进下个月 ⇒ 本地账本与腾讯云对不上。
+		name: 'M9 月份键改成 UTC（东八区每月最后 8 小时错月）',
+		file: 'bundle/host/core.mjs',
+		find: 'return new Date(nowMs + 8 * 3600 * 1000).toISOString().slice(0, 10)',
+		replace: 'return new Date(nowMs).toISOString().slice(0, 10)',
+		test: 'test/core-budget.test.mjs',
+	},
+	{
+		name: 'M10 签名里的 x-tc-action 不做小写（腾讯云会判签名不符）',
+		file: 'bundle/host/tencent-sign.mjs',
+		find: 'x-tc-action:${String(action).toLowerCase()}',
+		replace: 'x-tc-action:${String(action)}',
+		test: 'test/tencent-sign.test.mjs',
+	},
 ]
 
 /** 复制正本（跳过 .tmp），返回副本根目录。 */

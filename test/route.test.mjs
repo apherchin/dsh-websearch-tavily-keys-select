@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync } from 'node:fs'
+import { mkdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test, summary, assert, tempDir, cleanup, makeFakeCtx, makeFakeCredentials, makeFakeConnection, readResponse } from './harness.mjs'
 
@@ -6,9 +6,9 @@ import { test, summary, assert, tempDir, cleanup, makeFakeCtx, makeFakeCredentia
 const dir = tempDir('route')
 process.env.DSH_HOME = dir
 
-const { CONFIG_PATH, apply, routeFetch, readState, configPath, __resetFallbackRegistryForTests } = await import('../bundle/host/index-v5.mjs')
-const { readConfigDocument, writeConfigDocument } = await import('../bundle/host/config-store.mjs')
-const { MAX_SOURCES } = await import('../bundle/host/core.mjs')
+const { CONFIG_PATH, apply, routeFetch, readState, configPath, usagePath, __resetFallbackRegistryForTests } = await import('../bundle/host/index-v5.mjs')
+const { readConfigDocument, readUsageDocument, writeConfigDocument, writeUsageDocument } = await import('../bundle/host/config-store.mjs')
+const { MAX_SOURCES, beijingMonthKey } = await import('../bundle/host/core.mjs')
 
 // 模块级兜底注册表在同一进程里被别的测试文件挂过 ⇒ 先清空，保证本文件的断言与顺序无关。
 __resetFallbackRegistryForTests()
@@ -77,19 +77,28 @@ await test('GET：文件不存在时给默认文档 + 默认凭据状态 + 模�
 	const { status, body } = await readResponse(await get(ctx))
 	assert.equal(status, 200)
 	assert.equal(body.ok, true)
-	assert.equal(body.version, 1)
+	assert.equal(body.version, 2)
 	assert.equal(body.maxSources, MAX_SOURCES)
-	assert.deepEqual(body.templates, [{ kind: 'tavily', label: 'Tavily Key', refExample: 'TAVILY_API_KEY' }])
+	assert.deepEqual(body.templates, [
+		{ kind: 'yuanbao', label: '腾讯元宝搜索', refExample: 'TENCENTCLOUD_SECRET_KEY' },
+		{ kind: 'tavily', label: 'Tavily Key', refExample: 'TAVILY_API_KEY' },
+	])
+	const month = beijingMonthKey(Date.now())
+	const unlimitedUsage = { month, unlimited: true, monthly: null, reserve: 0, used: 0, remaining: null, exhausted: false, promo: null }
 	assert.deepEqual(body.sources, [
 		// ⚠️ 注意没有 `source` 键：`Response.json` 序列化会丢掉值为 undefined 的键。
 		// 界面因此只能按 `configured` / `writable` 分支（不去读 source）—— 与 spec §7 一致。
 		// 同一条教训在本仓库 session-delete 上踩过：attached=undefined 时该键在 JSON 里消失。
-		// 默认文档 = 两条（key1 → key2，2026-09-29 用户选定）。
-		{ id: 's1', kind: 'tavily', mode: 'env', ref: 'TAVILY_API_KEY1', credential: { configured: false, writable: true } },
-		{ id: 's2', kind: 'tavily', mode: 'env', ref: 'TAVILY_API_KEY2', credential: { configured: false, writable: true } },
+		// 默认文档 = 两条 Tavily（key1 → key2，2026-09-29 用户选定）。
+		{ id: 's1', kind: 'tavily', mode: 'env', ref: 'TAVILY_API_KEY1', budget: null, credential: { configured: false, writable: true }, usage: unlimitedUsage },
+		{ id: 's2', kind: 'tavily', mode: 'env', ref: 'TAVILY_API_KEY2', budget: null, credential: { configured: false, writable: true }, usage: unlimitedUsage },
 	])
+	assert.deepEqual(body.defaults, {
+		budgets: { yuanbao: { monthly: 2000, reserve: 100, promo: { monthly: 6000, until: '2026-11-30' } }, tavily: null },
+	})
 	assert.deepEqual(body.fallback, { kind: 'deepseek', enabled: false })
 	assert.equal(body.configError, null)
+	assert.equal(body.usageError, null)
 })
 
 await test('GET：文档损坏时照常 200，并用 configError 告知界面', async () => {
@@ -166,7 +175,7 @@ await test('POST 合法 env 提交 ⇒ 200、文档落盘、返回 applied', asy
 	const { status, body } = await readResponse(await post({ sources: [{ id: 's1', kind: 'tavily', mode: 'env', ref: 'TAVILY_API_KEY9' }] }, ctx))
 	assert.equal(status, 200)
 	assert.equal(body.ok, true)
-	assert.deepEqual(body.applied, { setRefs: [], unsetRefs: [], warnings: [] })
+	assert.deepEqual(body.applied, { setRefs: [], unsetRefs: [], warnings: [], usage: {} })
 	assert.deepEqual(readConfigDocument(configPath()).doc.sources, [{ id: 's1', kind: 'tavily', mode: 'env', ref: 'TAVILY_API_KEY9' }])
 	assert.equal(body.sources[0].ref, 'TAVILY_API_KEY9')
 })
@@ -253,6 +262,84 @@ await test('readState 直接可用（界面首次加载走的就是它）', asyn
 	assert.equal(Array.isArray(state.sources), true)
 })
 
+//#region 元宝搜索源（2026-10-22）
+const YUANBAO_SUBMISSION = {
+	id: 's1',
+	kind: 'yuanbao',
+	mode: 'env',
+	ref: 'TENCENTCLOUD_SECRET_KEY',
+	secretId: 'AKIDtestSecretId0000000000000000',
+	budget: { monthly: 2000, reserve: 100, promo: { monthly: 6000, until: '2026-11-30' } },
+}
+
+await test('POST yuanbao：落盘含 secretId + budget，GET 回来带额度状态（活动期按 6000 算）', async () => {
+	const ctx = makeFakeCtx({ credentials: makeFakeCredentials(), connection: makeFakeConnection() })
+	const { status, body } = await readResponse(await post({ sources: [YUANBAO_SUBMISSION] }, ctx))
+	assert.equal(status, 200)
+	assert.equal(body.ok, true)
+	const doc = readConfigDocument(configPath()).doc
+	assert.deepEqual(doc.sources[0].secretId, 'AKIDtestSecretId0000000000000000')
+	assert.deepEqual(doc.sources[0].budget, YUANBAO_SUBMISSION.budget)
+	const state = await readState(ctx)
+	const source = state.sources[0]
+	assert.equal(source.usage.used, 0)
+	assert.equal(source.usage.monthly, 6000, '活动期内生效额度是 6000')
+	assert.equal(source.usage.reserve, 100)
+	assert.equal(source.usage.remaining, 5900)
+	assert.equal(source.usage.exhausted, false)
+	assert.equal(source.usage.promo.active, true)
+})
+
+await test('POST yuanbao：SecretId 可更换（改一次就覆盖，不留旧值）', async () => {
+	const ctx = makeFakeCtx({ credentials: makeFakeCredentials(), connection: makeFakeConnection() })
+	await readResponse(await post({ sources: [YUANBAO_SUBMISSION] }, ctx))
+	const next = { ...YUANBAO_SUBMISSION, secretId: 'AKIDanotherSecretId000000000000000000' }
+	const { status } = await readResponse(await post({ sources: [next] }, ctx))
+	assert.equal(status, 200)
+	assert.equal(readConfigDocument(configPath()).doc.sources[0].secretId, 'AKIDanotherSecretId000000000000000000')
+})
+
+await test('POST yuanbao 缺 SecretId ⇒ 400 INVALID_SECRET_ID，且一个字都不写', async () => {
+	const ctx = makeFakeCtx({ credentials: makeFakeCredentials(), connection: makeFakeConnection() })
+	const before = readConfigDocument(configPath()).doc
+	const { status, body } = await readResponse(await post({ sources: [{ ...YUANBAO_SUBMISSION, secretId: '' }] }, ctx))
+	assert.equal(status, 400)
+	assert.equal(body.code, 'INVALID_SECRET_ID')
+	assert.deepEqual(readConfigDocument(configPath()).doc, before)
+})
+
+await test('POST 用量校准：只写在请求里出现的源，越界/未知 id ⇒ 400 INVALID_USAGE', async () => {
+	const ctx = makeFakeCtx({ credentials: makeFakeCredentials(), connection: makeFakeConnection() })
+	writeUsageDocument(usagePath(), { months: {} })
+	const { status, body } = await readResponse(await post({ sources: [YUANBAO_SUBMISSION], usage: { s1: 1234 } }, ctx))
+	assert.equal(status, 200)
+	assert.deepEqual(body.applied.usage, { s1: 1234 })
+	const month = beijingMonthKey(Date.now())
+	assert.equal(readUsageDocument(usagePath()).doc.months[month].s1, 1234)
+	assert.equal(body.sources[0].usage.used, 1234, 'GET 回来的状态要立刻反映校准值')
+
+	for (const usage of [{ s9: 1 }, { s1: -1 }, { s1: 'x' }, 'nope']) {
+		const rejected = await readResponse(await post({ sources: [YUANBAO_SUBMISSION], usage }, ctx))
+		assert.equal(rejected.status, 400, JSON.stringify(usage))
+		assert.equal(rejected.body.code, 'INVALID_USAGE')
+	}
+	// 被拒的校准不该改动账本
+	assert.equal(readUsageDocument(usagePath()).doc.months[month].s1, 1234)
+})
+
+await test('GET：用量文件损坏时照常 200，并给出 usageError（界面能看见）', async () => {
+	const { writeFileSync } = await import('node:fs')
+	// 清掉进程内用量缓存，才能断言"坏文件 ⇒ 按 0 计"这条降级（否则 max(文件, 缓存) 会拿缓存值）
+	__resetFallbackRegistryForTests()
+	writeFileSync(usagePath(), '{oops', 'utf8')
+	const ctx = makeFakeCtx({ credentials: makeFakeCredentials(), connection: makeFakeConnection() })
+	const { status, body } = await readResponse(await get(ctx))
+	assert.equal(status, 200)
+	assert.ok(typeof body.usageError === 'string' && body.usageError.includes('用量文件损坏'), body.usageError)
+	assert.equal(body.sources[0].usage.used, 0)
+})
+//#endregion
+
 await test('apply 两次（同一 ctx）也不抛：路由重复注册由 connection 自己兜（这里换新 connection）', () => {
 	const ctx = makeFakeCtx({ credentials: makeFakeCredentials(), connection: makeFakeConnection() })
 	assert.doesNotThrow(() => {
@@ -261,8 +348,16 @@ await test('apply 两次（同一 ctx）也不抛：路由重复注册由 connec
 	})
 })
 
-await test('目录被占成文件后 readConfigDocument 也不抛（防呆回归）', () => {
-	assert.equal(existsSync(configPath()), false)
+await test('配置文件被占成目录时 readConfigDocument 也不抛（防呆回归）', () => {
+	cleanup(configPath())
+	mkdirSync(configPath(), { recursive: true })
+	try {
+		const result = readConfigDocument(configPath())
+		assert.ok(typeof result.error === 'string' && result.error.length > 0, String(result.error))
+		assert.equal(result.doc.sources.length, 2, '读不了就退默认文档')
+	} finally {
+		cleanup(configPath())
+	}
 })
 
 summary('route')

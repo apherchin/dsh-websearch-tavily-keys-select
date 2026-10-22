@@ -30,13 +30,14 @@ function tavilyFail(status, detail) {
 	return new Response(JSON.stringify({ detail: { error: detail } }), { status, headers: { 'content-type': 'application/json' } })
 }
 /** 造一个走完 apply 的真实链（provider 由 ctx.web 捕获）。 */
-function mountChain({ credentials = makeFakeCredentials(), connection = makeFakeConnection() } = {}) {
+function mountChain({ credentials = makeFakeCredentials(), connection = makeFakeConnection(), chain = {} } = {}) {
 	const ctx = makeFakeCtx({ credentials, connection })
 	apply(ctx, {
 		role: 'chain',
 		id: 'tavily-chain',
 		tavily: { baseURL: 'https://tavily.invalid', searchDepth: 'basic', maxResults: 10, topic: 'general', timeoutMs: 3000 },
 		deepseek: { baseURL: 'https://deepseek.invalid', model: 'deepseek-v4-flash', maxTokens: 4096, maxUses: 5 },
+		...chain,
 	})
 	return { ctx, provider: ctx.__provider, credentials }
 }
@@ -210,8 +211,193 @@ await test('未知 role ⇒ 抛错（配置写错时立刻可见）', () => {
 })
 
 await test('emptyDocument 仍是空文档（回归守卫）', () => {
-	assert.deepEqual(emptyDocument(), { version: 1, sources: [] })
+	assert.deepEqual(emptyDocument(), { version: 2, sources: [] })
 })
+
+//#region 元宝搜索腿（2026-10-22）
+const { usagePath } = await import('../bundle/host/index-v5.mjs')
+const { writeUsageDocument } = await import('../bundle/host/config-store.mjs')
+const { beijingMonthKey } = await import('../bundle/host/core.mjs')
+const { mapYuanbaoPages } = await import('../bundle/host/index-v5.mjs')
+
+const SECRET_KEY_REF = 'TENCENTCLOUD_SECRET_KEY'
+const SECRET_ID = 'AKIDtestSecretId0000000000000000'
+/** 元宝搜索成功响应：Pages 是**字符串数组**，每个元素是 JSON 文本。 */
+function yuanbaoOk(items, extra = {}) {
+	return new Response(
+		JSON.stringify({
+			Response: {
+				Pages: items.map((item) => JSON.stringify(item)),
+				Query: 'q',
+				Version: 'standard',
+				RequestId: 'req-1',
+				...extra,
+			},
+		}),
+		{ status: 200, headers: { 'content-type': 'application/json' } },
+	)
+}
+const yuanbaoSource = (overrides = {}) => ({ id: 's1', kind: 'yuanbao', mode: 'env', ref: SECRET_KEY_REF, secretId: SECRET_ID, ...overrides })
+const resetUsage = () => { __resetFallbackRegistryForTests(); writeUsageDocument(usagePath(), { months: {} }) }
+
+await test('yuanbao 腿：签名头/请求体/结果映射都成立', async () => {
+	const credentials = makeFakeCredentials({ values: { [SECRET_KEY_REF]: 'sk-test' } })
+	const { provider } = mountChain({ credentials, chain: { yuanbao: { cnt: 10 } } })
+	resetUsage()
+	setDoc([yuanbaoSource()])
+	let seen
+	stubFetch(async (url, init) => {
+		seen = { url, init }
+		return yuanbaoOk([
+			{ title: '标题一', url: 'https://a.example/1', passage: '标准摘要', content: '动态摘要', date: '2026/10/22 09:00:00' },
+			{ title: '重复', url: 'https://a.example/1', passage: 'x' },
+			{ title: '无 passage', url: 'https://a.example/2', content: '只有动态摘要' },
+		])
+	})
+	try {
+		const result = await provider.search({ query: '今天北京的天气' }, undefined)
+		assert.equal(seen.url, 'https://wsa.tencentcloudapi.com/')
+		assert.equal(seen.init.method, 'POST')
+		assert.equal(seen.init.headers['x-tc-action'], 'SearchPro')
+		assert.equal(seen.init.headers['x-tc-version'], '2025-05-08')
+		assert.equal(seen.init.headers['content-type'], 'application/json; charset=utf-8')
+		assert.match(seen.init.headers.authorization, /^TC3-HMAC-SHA256 Credential=AKIDtestSecretId0000000000000000\/\d{4}-\d{2}-\d{2}\/wsa\/tc3_request, SignedHeaders=content-type;host;x-tc-action, Signature=[0-9a-f]{64}$/u)
+		assert.deepEqual(JSON.parse(seen.init.body), { Query: '今天北京的天气', Cnt: 10 })
+		assert.deepEqual(result.sources, [
+			{ url: 'https://a.example/1', title: '标题一', snippet: '标准摘要', publishedAt: '2026/10/22 09:00:00' },
+			{ url: 'https://a.example/2', title: '无 passage', snippet: '只有动态摘要' },
+		])
+	} finally {
+		stubFetch(realFetch)
+	}
+})
+
+await test('yuanbao 腿：一次成功调用会记进本月用量（北京时间月份桶）', async () => {
+	const credentials = makeFakeCredentials({ values: { [SECRET_KEY_REF]: 'sk-test' } })
+	const { provider } = mountChain({ credentials })
+	resetUsage()
+	setDoc([yuanbaoSource()])
+	stubFetch(async () => yuanbaoOk([{ url: 'https://a.example/1' }]))
+	try {
+		await provider.search({ query: 'q' }, undefined)
+		const month = beijingMonthKey(Date.now())
+		const { readUsageDocument } = await import('../bundle/host/config-store.mjs')
+		const usage = readUsageDocument(usagePath())
+		assert.equal(usage.doc.months[month].s1, 1, JSON.stringify(usage.doc))
+	} finally {
+		stubFetch(realFetch)
+	}
+})
+
+await test('★额度闸门：用到上限就**不再发请求**，改走后面的腿并记 quota-exhausted', async () => {
+	const credentials = makeFakeCredentials({ values: { [SECRET_KEY_REF]: 'sk-test', K2: 'k2' } })
+	const { provider } = mountChain({ credentials })
+	// 预算 2 次、保留 1 次 ⇒ 可用 1 次；已经用掉 1 次 ⇒ 到点
+	setDoc([yuanbaoSource({ budget: { monthly: 2, reserve: 1 } }), { id: 's2', kind: 'tavily', mode: 'env', ref: 'K2' }])
+	const month = beijingMonthKey(Date.now())
+	writeUsageDocument(usagePath(), { months: { [month]: { s1: 1 } } })
+	const urls = []
+	stubFetch(async (url) => {
+		urls.push(String(url))
+		return tavilyOk(['https://served-by-s2'])
+	})
+	try {
+		const result = await provider.search({ query: 'q' }, undefined)
+		assert.deepEqual(result.sources.map((source) => source.url), ['https://served-by-s2'])
+		assert.equal(urls.length, 1, '元宝那条腿一次请求都不该发')
+		assert.ok(urls[0].includes('tavily.invalid'), urls[0])
+		const log = readFileSync(`${dir}\\web-search-chain.log`, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+		const blocked = log.filter((entry) => entry.outcome === 'quota-exhausted').at(-1)
+		assert.ok(blocked !== undefined, '必须留一条 quota-exhausted 审计')
+		assert.equal(blocked.slot, 's1')
+		assert.equal(blocked.budget.exhausted, true)
+	} finally {
+		stubFetch(realFetch)
+	}
+})
+
+await test('额度闸门：用途中额度会随调用推进（第 1 次成功、第 2 次被拦）', async () => {
+	const credentials = makeFakeCredentials({ values: { [SECRET_KEY_REF]: 'sk-test' } })
+	const { provider } = mountChain({ credentials })
+	resetUsage()
+	setDoc([yuanbaoSource({ budget: { monthly: 1, reserve: 0 } })])
+	let calls = 0
+	stubFetch(async () => {
+		calls += 1
+		return yuanbaoOk([{ url: 'https://a.example/1' }])
+	})
+	try {
+		await provider.search({ query: 'q' }, undefined)
+		assert.equal(calls, 1)
+		await assert.rejects(
+			() => provider.search({ query: 'q' }, undefined),
+			(error) => {
+				assert.equal(error.code, 'WEB_PROVIDER_ERROR')
+				assert.ok(error.message.includes('quota-exhausted'), error.message)
+				return true
+			},
+		)
+		assert.equal(calls, 1, '超额后一个请求都不许发')
+	} finally {
+		stubFetch(realFetch)
+	}
+})
+
+await test('yuanbao 业务错误（HTTP 200 + Response.Error）⇒ 映射成腿失败并推进（AuthFailure）', async () => {
+	const credentials = makeFakeCredentials({ values: { [SECRET_KEY_REF]: 'sk-test', K2: 'k2' } })
+	const { provider } = mountChain({ credentials })
+	resetUsage()
+	setDoc([yuanbaoSource(), { id: 's2', kind: 'tavily', mode: 'env', ref: 'K2' }])
+	let call = 0
+	stubFetch(async () => {
+		call += 1
+		if (call === 1) {
+			return new Response(JSON.stringify({ Response: { Error: { Code: 'AuthFailure.SignatureFailure', Message: '签名错误' }, RequestId: 'r' } }), {
+				status: 200,
+				headers: { 'content-type': 'application/json' },
+			})
+		}
+		return tavilyOk(['https://served-by-s2'])
+	})
+	try {
+		const result = await provider.search({ query: 'q' }, undefined)
+		assert.deepEqual(result.sources.map((source) => source.url), ['https://served-by-s2'])
+	} finally {
+		stubFetch(realFetch)
+	}
+})
+
+await test('mapYuanbaoPages：脏元素跳过、去重、passage 优先、非数组当空', () => {
+	const pages = [JSON.stringify({ url: 'u1', passage: 'p', content: 'c' }), '{bad json', JSON.stringify({ url: 'u1' }), JSON.stringify({ title: '无 url' }), { url: 'u2' }]
+	assert.deepEqual(mapYuanbaoPages(pages), [{ url: 'u1', snippet: 'p' }, { url: 'u2' }])
+	assert.deepEqual(mapYuanbaoPages(undefined), [])
+	assert.deepEqual(mapYuanbaoPages('nope'), [])
+})
+
+await test('yuanbao 缺 SecretId ⇒ 记 credential-missing，不发请求', async () => {
+	const credentials = makeFakeCredentials({ values: { [SECRET_KEY_REF]: 'sk-test' } })
+	const { provider } = mountChain({ credentials })
+	resetUsage()
+	setDoc([{ id: 's1', kind: 'yuanbao', mode: 'env', ref: SECRET_KEY_REF }])
+	let calls = 0
+	stubFetch(async () => {
+		calls += 1
+		return yuanbaoOk([])
+	})
+	try {
+		await assert.rejects(
+			() => provider.search({ query: 'q' }, undefined),
+			(error) => {
+				assert.ok(error.message.includes('credential-missing'), error.message)
+				return true
+			},
+		)
+		assert.equal(calls, 0)
+	} finally {
+		stubFetch(realFetch)
+	}
+})
+//#endregion
 
 summary('chain-provider')
 cleanup(dir)

@@ -108,4 +108,60 @@ await test('nextIdIn / nextRefIn：取最小未用，且互不干扰', () => {
 	assert.equal(nextRefIn(new Set(['WEB_SEARCH_TAVILY_1'])), 'WEB_SEARCH_TAVILY_2')
 })
 
+await test('yuanbao 源：secretId 必填 → INVALID_SECRET_ID（field 指向那个输入框）', () => {
+	const yuanbao = { kind: 'yuanbao', mode: 'env', ref: 'TENCENTCLOUD_SECRET_KEY' }
+	for (const secretId of [undefined, '', '   ', 'has space']) {
+		const result = validateSubmission({ sources: [{ ...yuanbao, secretId }] }, emptyDocument())
+		assert.equal(result.code, 'INVALID_SECRET_ID', String(secretId))
+		assert.equal(result.field, 'sources[0].secretId')
+	}
+})
+
+await test('yuanbao 源：secretId 两侧空白被 trim，budget 原样归一化带出', () => {
+	const result = validateSubmission(
+		{
+			sources: [
+				{
+					kind: 'yuanbao',
+					mode: 'env',
+					ref: 'TENCENTCLOUD_SECRET_KEY',
+					secretId: '  AKIDtestSecretId0000000000000000  ',
+					budget: { monthly: 6000, reserve: 300, promo: { monthly: 6000, until: '2026-11-30' } },
+				},
+			],
+		},
+		emptyDocument(),
+	)
+	assert.equal(result.ok, true)
+	assert.equal(result.sources[0].secretId, 'AKIDtestSecretId0000000000000000')
+	assert.deepEqual(result.sources[0].budget, { monthly: 6000, reserve: 300, promo: { monthly: 6000, until: '2026-11-30' } })
+})
+
+await test('yuanbao 源：budget 非法 → INVALID_BUDGET（不做静默 clamp）', () => {
+	for (const budget of [{ monthly: -1 }, { monthly: 100, reserve: 101 }, { monthly: 0, reserve: 1 }, { monthly: 1.5 }]) {
+		const result = validateSubmission(
+			{ sources: [{ kind: 'yuanbao', mode: 'env', ref: 'K1', secretId: 'AKIDxxxxxxxx', budget }] },
+			emptyDocument(),
+		)
+		assert.equal(result.code, 'INVALID_BUDGET', JSON.stringify(budget))
+		assert.equal(result.field, 'sources[0].budget')
+	}
+})
+
+await test('tavily 源：即使请求里带了 secretId / budget 也不会被写进文档（形状收紧）', () => {
+	const result = validateSubmission({ sources: [{ kind: 'tavily', mode: 'env', ref: 'K1', secretId: 'AKIDxxxx', budget: { monthly: 5 } }] }, emptyDocument())
+	assert.equal(result.ok, true)
+	assert.equal('secretId' in result.sources[0], false)
+	// budget 是通用能力（Tavily 也可以限流），所以这里允许带
+	assert.deepEqual(result.sources[0].budget, { monthly: 5, reserve: 0 })
+})
+
+await test('yuanbao + 明文：沿用旧 literal ref、密钥进 secrets（与 tavily 同一套凭据域）', () => {
+	const prior = { version: 2, sources: [{ id: 's1', kind: 'tavily', mode: 'literal', ref: 'WEB_SEARCH_TAVILY_2' }] }
+	const result = validateSubmission({ sources: [{ id: 's1', kind: 'yuanbao', mode: 'literal', secretId: 'AKIDxxxxxxxx', secret: 'sk-tencent' }] }, prior)
+	assert.equal(result.ok, true)
+	assert.equal(result.sources[0].ref, 'WEB_SEARCH_TAVILY_2')
+	assert.deepEqual(result.secrets, [{ id: 's1', ref: 'WEB_SEARCH_TAVILY_2', secret: 'sk-tencent' }])
+})
+
 summary('core-validate')

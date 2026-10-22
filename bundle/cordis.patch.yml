@@ -1,10 +1,17 @@
 # Layer owned by the `dsh-web-search-chain` bundle.
 #
-# 2026-09-29 起 Tavily 源**不再是 loader 行**：源列表（0~3 个）由插件自己的配置文档
+# 2026-09-29 起搜索源**不再是 loader 行**：源列表（0~3 个）由插件自己的配置文档
 # `$DSH_HOME\web-search-chain.json` 决定，侧栏 Plugins → dsh-web-search-chain 包页的配置卡片
 # 是唯一真源。这里只剩两行：
 #   web-search-source-deepseek  官方搜索兜底；同时是**花钱总开关**（关掉就不花官方钱）
 #   web-search-chain            链本体：注册 `ctx.web` 选中的 provider + 提供配置路由
+#
+# 2026-10-22 起支持 `kind: yuanbao`（腾讯云元宝搜索 SearchPro）。传输参数放在链本体行：
+#   yuanbao.mode / yuanbao.cnt / yuanbao.industry / yuanbao.freshness / yuanbao.timeoutMs
+# ⚠️ 本机是**标准版**，支持 Mode/Cnt；**极速版不支持这两个参数**，换成极速版时必须删掉它们
+#    （插件的代码默认一个都不发，是这一行显式打开的）。
+# ⚠️ 额度（每月 2000 次，活动期 6000 次）不在这里配：它是**每个源**的 `budget` 字段，
+#    在配置卡片里改（带活动到期日，2026-11-30 之后自动降回 2000）。
 #
 # ⚠️ 改本文件后：`node sync-to-profile.mjs --apply` → **整机重启** DSH。
 - insert:
@@ -28,6 +35,11 @@
           maxResults: 10
           topic: general
           includePublishedDate: false
+          timeoutMs: 30000
+        yuanbao:
+          baseURL: https://wsa.tencentcloudapi.com   # 就近地域接入域名（也可换成 wsa.ap-guangzhou…）
+          mode: 2                     # 0 公开网页 / 1 权威垂直 / 2 混合（标准版、旗舰版支持）
+          cnt: 10                     # 10/20/30/40/50（标准版、旗舰版支持）
           timeoutMs: 30000
         deepseek:
           baseURL: https://api.deepseek.com/anthropic/v1

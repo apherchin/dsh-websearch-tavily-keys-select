@@ -1,34 +1,47 @@
 /**
  * Web search provider chain for DSH.
  *
- * Tavily 源（0~3 个）+ 官方 DeepSeek 搜索兜底。与旧版的唯一区别是**源从哪来**：
- * 旧版把源做成了三条 loader 行（key1/key2/deepseek）并在进程内注册表里发布；
- * 现在 **Tavily 源列表由配置文件决定**（`$DSH_HOME\web-search-chain.json`，界面是唯一真源），
- * 链路**每次搜索都重读**该文件 —— 一次 `statSync` + 一次小文件读取换掉整类「缓存失效/热更新」bug。
+ * 源（0~3 个）+ 官方 DeepSeek 搜索兜底。源从哪来：**配置文件**
+ * （`$DSH_HOME\web-search-chain.json`，界面是唯一真源），链路**每次搜索都重读**该文件
+ * —— 一次 `statSync` + 一次小文件读取换掉整类「缓存失效/热更新」bug。
+ *
+ * 2026-10-22 起支持两种源：
+ * - `tavily`：POST `https://api.tavily.com/search`，Bearer 密钥；
+ * - `yuanbao`：腾讯云元宝搜索 `SearchPro`（`wsa.tencentcloudapi.com`），TC3-HMAC-SHA256 签名，
+ *   **带额度闸门**（免费额度按北京时间自然月；标准版超额 20 元/千次，是 DS 搜索 API 的 4 倍）。
  *
  * 官方兜底仍是一条 loader 行（`web-search-source-deepseek`），因为它同时是**花钱总开关**：
  * 关掉那行就不花官方钱。
  *
  * 本模块刻意**零 `@deepseek-ai/*` 静态依赖**（只用 `node:*` 与自身相对路径），
  * profile 解析器因此不必为这些行映射裸 specifier；官方 provider 通过**懒动态 import** 复用，
- * 拿不到时 Tavily 腿照常工作、只有最后一条腿报错。
+ * 拿不到时其它腿照常工作、只有最后一条腿报错。
  *
  * 审计：每个动作一行 JSON 追加到 `<DSH_HOME>\web-search-chain.log` —— 唯一能证明
- * 「哪条源服务了、什么时候花了官方钱」的 durable 记录。
+ * 「哪条源服务了、什么时候花了钱、额度还剩多少」的 durable 记录。
  */
 import { appendFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
+	ID_PATTERN,
+	MAX_MONTHLY_BUDGET,
 	MAX_SOURCES,
 	REF_PATTERN,
 	TEMPLATES,
+	beijingMonthKey,
+	budgetStatus,
+	defaultBudgetFor,
 	defaultDocument,
 	describeAttempts,
+	effectiveBudget,
 	orderedLegs,
 	unusedRefs,
+	usageCount,
 	validateSubmission,
+	withUsageCount,
 } from './core.mjs'
-import { configDocumentPath, readConfigDocument, writeConfigDocument } from './config-store.mjs'
+import { configDocumentPath, readConfigDocument, readUsageDocument, usageDocumentPath, writeConfigDocument, writeUsageDocument } from './config-store.mjs'
+import { JSON_CONTENT_TYPE, buildTc3Authorization } from './tencent-sign.mjs'
 
 export const name = 'web-search-chain'
 export const inject = ['web']
@@ -41,13 +54,36 @@ const DEFAULT_FALLBACK_REF = 'DEEPSEEK_API_KEY'
 const TAVILY_DEFAULT_BASE_URL = 'https://api.tavily.com'
 /** 官方 DeepSeek Anthropic 兼容端点缺省值；`/messages` 由官方 provider 拼。 */
 const DEEPSEEK_DEFAULT_BASE_URL = 'https://api.deepseek.com/anthropic/v1'
+/** 元宝搜索端点缺省值（就近地域接入域名）。 */
+const YUANBAO_DEFAULT_BASE_URL = 'https://wsa.tencentcloudapi.com'
+/** 元宝搜索 API 版本（`SearchPro` 所属版本）。 */
+const YUANBAO_API_VERSION = '2025-05-08'
+/** 元宝搜索接口名。 */
+const YUANBAO_ACTION = 'SearchPro'
+/** 元宝搜索的签名服务名（域名前缀）。 */
+const YUANBAO_SERVICE = 'wsa'
+/** `Mode` 合法枚举（0 公开网页 / 1 权威垂直 / 2 混合）。 */
+const YUANBAO_MODES = [0, 1, 2]
+/** `Cnt` 合法枚举（极速版不支持该参数，所以默认不发）。 */
+const YUANBAO_COUNTS = [10, 20, 30, 40, 50]
+/** `Industry` 合法枚举。 */
+const YUANBAO_INDUSTRIES = ['gov', 'news', 'acad', 'finance']
 /** Tavily 请求的 UA。 */
-const USER_AGENT = 'deepseek-harness-search-chain/2.0.0'
+const USER_AGENT = 'deepseek-harness-search-chain/3.0.0'
 const SEARCH_DEPTHS = ['advanced', 'basic', 'fast', 'ultra-fast']
 const TOPICS = ['general', 'news', 'finance']
 
 /** 已挂载的兜底源行（槽位 → 条目）。与旧版一样，同一模块 URL 的多个行共享这一份注册表。 */
 const enabledFallback = new Map()
+
+/**
+ * 进程内的用量缓存（`<month>:<sourceId>` → 次数）。
+ *
+ * 为什么需要它：额度闸门是「读文件 → 比大小 → 写文件」。写盘失败（磁盘满/权限）时如果仅靠文件，
+ * 下一次读回来还是旧值 ⇒ 闸门形同虚设，而每次超额要按 20 元/千次计费。
+ * 因此取 `max(文件, 缓存)` 作为事实，并且在写失败时**仍然**推进缓存。
+ */
+const usageCache = new Map()
 
 /** 尽最大努力写一条 warn：日志本身绝不许打穿调用方。 */
 function warn(ctx, message) {
@@ -66,6 +102,11 @@ function homeDir() {
 /** 配置文档路径（每次调用都重新解析 env，便于测试注入）。 */
 export function configPath() {
 	return configDocumentPath(homeDir())
+}
+
+/** 用量文档路径。 */
+export function usagePath() {
+	return usageDocumentPath(homeDir())
 }
 
 /** 审计日志路径。 */
@@ -100,7 +141,7 @@ function clampInteger(value, min, max, fallback) {
 }
 
 /**
- * 归一化兜底源行。**现在只剩这一种源行** —— Tavily 源由配置文档决定，
+ * 归一化兜底源行。**现在只剩这一种源行** —— 真实源由配置文档决定，
  * 再看到 `slot: key1/key2` 这类写法就是旧配置没清干净，直接报错让它可见。
  * @param config - 该行的原始 config。
  * @returns 该槽位的注册表条目。
@@ -110,7 +151,7 @@ function normalizeSource(config) {
 	const slot = optionalString(source.slot)
 	if (slot !== FALLBACK_SLOT) {
 		throw new Error(
-			`web-search-chain: a source row must declare slot: "${FALLBACK_SLOT}" (got ${JSON.stringify(source.slot)}); Tavily sources now come from the configuration document`,
+			`web-search-chain: a source row must declare slot: "${FALLBACK_SLOT}" (got ${JSON.stringify(source.slot)}); Tavily/Yuanbao sources now come from the configuration document`,
 		)
 	}
 	return { slot, kind: 'deepseek', keyRef: optionalString(source.keyRef) ?? DEFAULT_FALLBACK_REF }
@@ -125,6 +166,7 @@ export function normalizeChain(config) {
 	const source = config ?? {}
 	const tavily = source.tavily ?? {}
 	const deepseek = source.deepseek ?? {}
+	const yuanbao = source.yuanbao ?? {}
 	const tavilyBaseURL = optionalString(tavily.baseURL) ?? optionalString(source.tavilyBaseURL) ?? TAVILY_DEFAULT_BASE_URL
 	return {
 		id: optionalString(source.id) ?? 'tavily-chain',
@@ -139,6 +181,17 @@ export function normalizeChain(config) {
 		deepseekApiVersion: optionalString(deepseek.apiVersion) ?? '2023-06-01',
 		deepseekMaxTokens: clampInteger(deepseek.maxTokens, 1, Number.MAX_SAFE_INTEGER, 4096),
 		deepseekMaxUses: clampInteger(deepseek.maxUses, 1, Number.MAX_SAFE_INTEGER, 5),
+		yuanbao: {
+			baseURL: (optionalString(yuanbao.baseURL) ?? YUANBAO_DEFAULT_BASE_URL).replace(/\/+$/u, ''),
+			version: optionalString(yuanbao.version) ?? YUANBAO_API_VERSION,
+			// ⚠️ 三个可选参数默认**都不发**：极速版不支持 Mode/Cnt/Industry，
+			// 默认发出去会让极速版用户每次搜索都 400。标准版/旗舰版可在链行配置里打开。
+			mode: YUANBAO_MODES.includes(yuanbao.mode) ? yuanbao.mode : undefined,
+			cnt: YUANBAO_COUNTS.includes(yuanbao.cnt) ? yuanbao.cnt : undefined,
+			industry: YUANBAO_INDUSTRIES.includes(yuanbao.industry) ? yuanbao.industry : undefined,
+			freshness: optionalString(yuanbao.freshness),
+			timeoutMs: clampInteger(yuanbao.timeoutMs, 1, 600000, 30000),
+		},
 	}
 }
 
@@ -174,6 +227,58 @@ function mapTavilySources(payload) {
 		})
 	}
 	return sources
+}
+
+/**
+ * 把元宝搜索的 `Response.Pages` 映射成 seam 的 `WebSearchResult.sources`。
+ *
+ * 形状（官方文档）：`Pages` 是**字符串数组**，每个元素是一个 JSON 文本，字段有
+ * `title / url / date / passage / content / site / score / …`。两条实现要点：
+ * 1. 单个元素解析失败就跳过它（一条脏数据不该让整次搜索失败）；
+ * 2. `passage`（标准摘要）优先于 `content`（动态摘要，极速版不返回）。
+ *
+ * @param pages - `Response.Pages`（可能不是数组）。
+ */
+export function mapYuanbaoPages(pages) {
+	const sources = []
+	const seen = new Set()
+	for (const raw of Array.isArray(pages) ? pages : []) {
+		let item = raw
+		if (typeof raw === 'string') {
+			try {
+				item = JSON.parse(raw)
+			} catch {
+				continue
+			}
+		}
+		if (item === null || typeof item !== 'object') continue
+		const url = typeof item.url === 'string' ? item.url : ''
+		if (url.length === 0 || seen.has(url)) continue
+		seen.add(url)
+		const passage = typeof item.passage === 'string' && item.passage.length > 0 ? item.passage : undefined
+		const content = typeof item.content === 'string' && item.content.length > 0 ? item.content : undefined
+		sources.push({
+			url,
+			...(typeof item.title === 'string' && item.title.length > 0 ? { title: item.title } : {}),
+			...(passage !== undefined ? { snippet: passage } : content !== undefined ? { snippet: content } : {}),
+			...(typeof item.date === 'string' && item.date.length > 0 ? { publishedAt: item.date } : {}),
+		})
+	}
+	return sources
+}
+
+/** 元宝搜索的业务错误（HTTP 200 + `Response.Error`）→ `ChainError`。 */
+function yuanbaoError(error) {
+	const code = typeof error?.Code === 'string' && error.Code.length > 0 ? error.Code : 'Error'
+	const message = typeof error?.Message === 'string' ? error.Message : ''
+	const mapped = code.startsWith('AuthFailure')
+		? 'WEB_PROVIDER_AUTH'
+		: code === 'RequestLimitExceeded'
+			? 'RATE_LIMIT'
+			: code === 'ResourceNotFound' || code === 'ResourceUnavailable'
+				? 'WEB_PROVIDER_UNAVAILABLE'
+				: 'WEB_PROVIDER_ERROR'
+	return new ChainError(`Yuanbao search failed (${code})${message.length > 0 ? `: ${message}` : ''}`, mapped)
 }
 
 /** 读 Tavily 的 `{detail:{error}}` 失败体，绝不因为读失败体而失败。 */
@@ -232,12 +337,16 @@ export class ChainSearchProvider {
 	 * @param getConfig - 返回当前归一化链配置的 thunk。
 	 * @param readDocument - 返回 `{doc, error}` 的 thunk（每次调用都重读，无缓存）。
 	 * @param loadFallback - 加载官方 provider 类；测试可注入假的。
+	 * @param runtime - 测试注入点：`{ readUsage, writeUsage, now }`；缺省用真实实现。
 	 */
-	constructor(ctx, getConfig, readDocument, loadFallback = loadDeepSeekProviderClass) {
+	constructor(ctx, getConfig, readDocument, loadFallback = loadDeepSeekProviderClass, runtime = {}) {
 		this.ctx = ctx
 		this.getConfig = getConfig
 		this.readDocument = readDocument
 		this.loadFallback = loadFallback
+		this.readUsage = runtime.readUsage ?? (() => readUsageDocument(usagePath()))
+		this.writeUsage = runtime.writeUsage ?? ((doc) => writeUsageDocument(usagePath(), doc))
+		this.now = runtime.now ?? (() => Date.now())
 	}
 
 	/** seam 用 `searchProvider` 选中的注册表键。 */
@@ -251,12 +360,44 @@ export class ChainSearchProvider {
 		return doc.sources.length > 0 || enabledFallback.size > 0
 	}
 
+	/**
+	 * 本月某源已用次数：取 `max(文件, 进程缓存)`。
+	 * 读失败一律当 0（宁可少算一次也不抛——少算的风险由 `reserve` 余量兜着）。
+	 */
+	usedThisMonth(sourceId, month) {
+		let fromFile = 0
+		try {
+			fromFile = usageCount(this.readUsage().doc, month, sourceId)
+		} catch {
+			fromFile = 0
+		}
+		return Math.max(fromFile, usageCache.get(`${month}:${sourceId}`) ?? 0)
+	}
+
+	/**
+	 * 记一次调用（**在发请求之前** +1）：失败也算、超时也算。
+	 * 保守方向是对的——超额调用的单价是 DS 搜索的 4 倍，多算一次比少算一次便宜得多。
+	 * @returns 递增后的本月已用次数。
+	 */
+	bumpUsage(sourceId, month) {
+		const next = this.usedThisMonth(sourceId, month) + 1
+		usageCache.set(`${month}:${sourceId}`, next)
+		try {
+			const { doc } = this.readUsage()
+			this.writeUsage(withUsageCount(doc, month, sourceId, next))
+		} catch {
+			// 写盘失败不影响搜索；缓存已经把闸门推进了
+		}
+		return next
+	}
+
 	/** 按固定腿序跑一次搜索。 */
 	async search(request, signal) {
 		const config = this.getConfig()
 		const { doc } = this.readDocument()
 		const legs = orderedLegs(doc.sources, [...enabledFallback.values()][0])
 		const attempts = []
+		const month = beijingMonthKey(this.now())
 
 		for (const leg of legs) {
 			throwIfAborted(signal)
@@ -274,11 +415,69 @@ export class ChainSearchProvider {
 				return provider.search(request, signal)
 			}
 
+			// 腿只带定位信息，额度/SecretId 这些从文档按 id 取（见 core.orderedLegs 的注释）
+			const source = doc.sources.find((candidate) => candidate.id === leg.id) ?? { id: leg.id, kind: leg.kind, ref: leg.ref }
 			const apiKey = await this.resolveCredential(leg.ref)
 			if (apiKey === undefined) {
 				attempts.push({ id: leg.id, ref: leg.ref, outcome: 'credential-missing' })
 				continue
 			}
+
+			if (leg.kind === 'yuanbao') {
+				const secretId = optionalString(source.secretId)
+				if (secretId === undefined) {
+					attempts.push({ id: leg.id, ref: leg.ref, outcome: 'credential-missing', message: 'SecretId is missing' })
+					continue
+				}
+				const status = budgetStatus(source, this.usedThisMonth(leg.id, month), this.now())
+				if (status.exhausted) {
+					// 到点即停：不花那 4 倍的钱，把机会交给后面的腿（官方兜底那条行才是花钱总开关）
+					this.record(config, {
+						outcome: 'quota-exhausted',
+						target: 'yuanbao',
+						slot: leg.id,
+						ref: leg.ref,
+						query: request.query,
+						budget: status,
+						priorAttempts: attempts,
+					})
+					attempts.push({
+						id: leg.id,
+						ref: leg.ref,
+						outcome: 'quota-exhausted',
+						message: `${status.used}/${status.monthly} calls used this month (reserve ${status.reserve})`,
+					})
+					continue
+				}
+				const used = this.bumpUsage(leg.id, month)
+				try {
+					const result = await this.searchYuanbao(config, { secretId, secretKey: apiKey }, request, signal)
+					this.record(config, {
+						outcome: 'served',
+						target: 'yuanbao',
+						slot: leg.id,
+						ref: leg.ref,
+						query: request.query,
+						sources: result.sources.length,
+						apiVersion: result.version,
+						requestId: result.requestId,
+						used,
+						budget: { monthly: status.monthly, reserve: status.reserve },
+						priorAttempts: attempts,
+					})
+					return { sources: result.sources, truncated: false }
+				} catch (error) {
+					if (signal?.aborted === true) throw error
+					attempts.push({
+						id: leg.id,
+						ref: leg.ref,
+						outcome: 'failed',
+						message: error instanceof Error ? error.message : String(error),
+					})
+					continue
+				}
+			}
+
 			try {
 				const result = await this.searchTavily(config, apiKey, request, signal)
 				this.record(config, {
@@ -351,6 +550,97 @@ export class ChainSearchProvider {
 		}
 	}
 
+	/**
+	 * 一次元宝搜索 `SearchPro` 调用（TC3 签名 + 自己的超时）。
+	 *
+	 * 两个腾讯云特有的坑：
+	 * 1. **业务错误是 HTTP 200 + `Response.Error`**（`AuthFailure.SignatureFailure`、`RequestLimitExceeded`…），
+	 *    所以必须先看 `Response.Error` 再看 HTTP 状态；
+	 * 2. 签名要求 `Content-Type`、`Host`、`X-TC-Action` 与实际发送的**逐字一致**，且 `X-TC-Timestamp`
+	 *    与签名里用的时间戳相同（否则 `AuthFailure.SignatureExpire`）。
+	 *
+	 * @param config - 归一化链配置。
+	 * @param credentials - `{secretId, secretKey}`。
+	 * @param request - seam 的搜索请求（`query` / 可选 `maxResults`）。
+	 * @param signal - 调用方取消信号。
+	 */
+	async searchYuanbao(config, credentials, request, signal) {
+		const settings = config.yuanbao
+		const endpoint = `${settings.baseURL}/`
+		const body = { Query: request.query }
+		const cnt = this.yuanbaoCount(settings, request)
+		if (cnt !== undefined) body.Cnt = cnt
+		if (settings.mode !== undefined) body.Mode = settings.mode
+		if (settings.industry !== undefined) body.Industry = settings.industry
+		if (settings.freshness !== undefined) body.Freshness = settings.freshness
+		const payload = JSON.stringify(body)
+		const timestamp = Math.floor(this.now() / 1000)
+		const { authorization } = buildTc3Authorization({
+			secretId: credentials.secretId,
+			secretKey: credentials.secretKey,
+			service: YUANBAO_SERVICE,
+			host: new URL(endpoint).host,
+			action: YUANBAO_ACTION,
+			payload,
+			timestamp,
+		})
+		const link = linkAbort(signal, settings.timeoutMs)
+		try {
+			const response = await fetch(endpoint, {
+				method: 'POST',
+				redirect: 'error',
+				headers: {
+					authorization,
+					'content-type': JSON_CONTENT_TYPE,
+					accept: 'application/json',
+					'x-tc-action': YUANBAO_ACTION,
+					'x-tc-version': settings.version,
+					'x-tc-timestamp': String(timestamp),
+					'user-agent': USER_AGENT,
+				},
+				body: payload,
+				signal: link.signal,
+			})
+			const text = await response.text()
+			let parsed
+			try {
+				parsed = JSON.parse(text)
+			} catch {
+				throw new ChainError(`Yuanbao search returned a non-JSON body (HTTP ${response.status})`, 'WEB_PROVIDER_ERROR')
+			}
+			const envelope = parsed?.Response ?? {}
+			if (envelope.Error !== undefined) throw yuanbaoError(envelope.Error)
+			if (!response.ok) {
+				throw new ChainError(`Yuanbao search failed (HTTP ${response.status})`, response.status === 429 ? 'RATE_LIMIT' : 'WEB_PROVIDER_ERROR')
+			}
+			const sources = mapYuanbaoPages(envelope.Pages)
+			const limit = request.maxResults ?? config.maxResults
+			return {
+				sources: Number.isInteger(limit) && limit > 0 ? sources.slice(0, limit) : sources,
+				version: optionalString(envelope.Version),
+				requestId: optionalString(envelope.RequestId),
+			}
+		} catch (error) {
+			if (signal?.aborted === true) throw error
+			if (link.didTimeOut()) {
+				throw new ChainError(`Yuanbao search timed out after ${settings.timeoutMs}ms`, 'TIMEOUT')
+			}
+			throw error
+		} finally {
+			link.dispose()
+		}
+	}
+
+	/**
+	 * `Cnt` 取值：请求里的 `maxResults` 优先（向上取到 10 的整数倍并夹到 10~50），
+	 * 否则用链行配置的 `cnt`，再没有就**不发**（极速版不认这个参数）。
+	 */
+	yuanbaoCount(settings, request) {
+		const requested = Number.isInteger(request?.maxResults) && request.maxResults > 0 ? request.maxResults : undefined
+		if (requested !== undefined) return Math.min(50, Math.max(10, Math.ceil(requested / 10) * 10))
+		return settings.cnt
+	}
+
 	/** 官方 provider 每次操作前读的选项。 */
 	deepSeekOptions(config, leg) {
 		return {
@@ -393,7 +683,7 @@ export class ChainSearchProvider {
 
 	/** 记一行审计。审计绝不许弄坏一次搜索。 */
 	record(config, payload) {
-		const entry = { at: new Date().toISOString(), provider: config.id, ...payload }
+		const entry = { at: new Date(this.now()).toISOString(), provider: config.id, ...payload }
 		try {
 			appendFileSync(auditFile(), `${JSON.stringify(entry)}\n`)
 		} catch {
@@ -501,14 +791,16 @@ export function apply(ctx, config) {
 export { MAX_SOURCES, TEMPLATES, defaultDocument, warn }
 
 /**
- * **只给离线测试用**：清空兜底源注册表。
+ * **只给离线测试用**：清空兜底源注册表与用量缓存。
  *
  * 模块级注册表是设计需要（同一模块 URL 的多条 loader 行必须共享一份），代价是同一进程里
  * 连续跑多个测试文件时会互相污染 —— 实测 `run-all.mjs` 里 route 断言因此从 22/22 掉到 21/22。
- * 每个依赖「注册表为空」的测试文件在开头调它做隔离。
+ * 每个依赖「注册表为空」的测试文件在开头调它做隔离；用量缓存同理（否则前一个文件记的次数
+ * 会让后一个文件的额度用例提前撞上限）。
  */
 export function __resetFallbackRegistryForTests() {
 	enabledFallback.clear()
+	usageCache.clear()
 }
 
 //#region 配置路由：GET 读状态 / POST 保存（全有全无）
@@ -543,21 +835,41 @@ async function describeCredential(ctx, ref) {
 	return { configured, source: configured ? 'process-env' : undefined, writable: false }
 }
 
-/** 界面用的整份状态。 */
+/**
+ * 界面用的整份状态。
+ *
+ * 每个源带三块：
+ * - `credential`：`{configured, source, writable}`（**从不含明文**）；
+ * - `budget`：编辑用的预算（文档里的，或该模板的默认值；`null` = 不限）；
+ * - `usage`：本月计数与闸门状态（`{month, used, monthly, reserve, remaining, exhausted, promo}`）。
+ */
 export async function readState(ctx) {
 	const { doc, error } = readConfigDocument(configPath())
+	const usage = readUsageDocument(usagePath())
+	const month = beijingMonthKey(Date.now())
 	const sources = []
 	for (const source of doc.sources) {
-		sources.push({ ...source, credential: await describeCredential(ctx, source.ref) })
+		const budget = effectiveBudget(source) ?? null
+		// 与额度闸门同口径：取 max(文件, 进程缓存)，否则写盘失败时界面会少报已用次数
+		const used = Math.max(usageCount(usage.doc, month, source.id), usageCache.get(`${month}:${source.id}`) ?? 0)
+		sources.push({
+			...source,
+			budget,
+			credential: await describeCredential(ctx, source.ref),
+			usage: { month, ...budgetStatus(source, used, Date.now()) },
+		})
 	}
 	return {
 		ok: true,
 		version: doc.version,
 		maxSources: MAX_SOURCES,
 		templates: TEMPLATES.map((template) => ({ ...template })),
+		// 模板默认预算：界面「添加」时预填，保证新源与"不填 budget"的语义一致（含活动额度）。
+		defaults: { budgets: Object.fromEntries(TEMPLATES.map((template) => [template.kind, defaultBudgetFor(template.kind) ?? null])) },
 		sources,
 		fallback: { kind: 'deepseek', enabled: enabledFallback.size > 0 },
 		configError: error ?? null,
+		usageError: usage.error ?? null,
 	}
 }
 
@@ -567,11 +879,32 @@ function respond(status, payload) {
 }
 
 /**
+ * 解析界面提交的「本月已用」校准值（`{sourceId: count}`）。
+ * 只接受非负整数，且 id 必须出现在这次提交的源里（防止写进幽灵计数）。
+ */
+function parseUsagePatch(raw, sources) {
+	if (raw === undefined) return { ok: true, values: {} }
+	if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, message: 'usage 必须是 {源id: 次数} 的对象' }
+	const live = new Set(sources.map((source) => source.id))
+	const values = {}
+	for (const [id, value] of Object.entries(raw)) {
+		if (!ID_PATTERN.test(id)) return { ok: false, message: `usage 里的源 id ${JSON.stringify(id)} 非法` }
+		if (!live.has(id)) return { ok: false, message: `usage 里的源 ${JSON.stringify(id)} 不在这份配置里` }
+		if (!Number.isInteger(value) || value < 0 || value > MAX_MONTHLY_BUDGET) {
+			return { ok: false, message: `usage.${id} 必须是不大于 ${MAX_MONTHLY_BUDGET} 的非负整数` }
+		}
+		values[id] = value
+	}
+	return { ok: true, values }
+}
+
+/**
  * 保存一次提交。写入顺序**不可颠倒**：
  *   1. 全量校验（任何一项不过 ⇒ 一个字节都不写）；
  *   2. 凭据（先 set 后 unset）；任一失败 ⇒ 整单放弃，**文档不写** ——
  *      保证文档里不会引用一个创建失败的 ref；
- *   3. 文档（临时文件 + rename 原子替换）。
+ *   3. 文档（临时文件 + rename 原子替换）；
+ *   4. 用量校准（可失败：只进 warnings，不回滚已经存好的配置）。
  */
 export async function applyConfig(ctx, body) {
 	const path = configPath()
@@ -585,10 +918,15 @@ export async function applyConfig(ctx, body) {
 			...(validation.field === undefined ? {} : { field: validation.field }),
 		})
 	}
+	const usagePatch = parseUsagePatch(body?.usage, validation.sources)
+	if (!usagePatch.ok) {
+		return respond(400, { ok: false, code: 'INVALID_USAGE', message: usagePatch.message, field: 'usage' })
+	}
 
 	const credentials = ctx.get('credentials')
 	const setRefs = []
 	const unsetRefs = []
+	const warnings = []
 
 	for (const entry of validation.secrets) {
 		if (credentials === undefined) {
@@ -629,8 +967,24 @@ export async function applyConfig(ctx, body) {
 		return respond(500, { ok: false, code: 'CONFIG_WRITE_FAILED', message: `写入配置失败：${String(error)}` })
 	}
 
+	const appliedUsage = {}
+	if (Object.keys(usagePatch.values).length > 0) {
+		try {
+			const month = beijingMonthKey(Date.now())
+			let next = readUsageDocument(usagePath()).doc
+			for (const [id, value] of Object.entries(usagePatch.values)) {
+				next = withUsageCount(next, month, id, value)
+				usageCache.set(`${month}:${id}`, value)
+				appliedUsage[id] = value
+			}
+			writeUsageDocument(usagePath(), next)
+		} catch (error) {
+			warnings.push(`用量校准没写进去：${String(error)}`)
+		}
+	}
+
 	const state = await readState(ctx)
-	return respond(200, { ...state, applied: { setRefs, unsetRefs, warnings: [] } })
+	return respond(200, { ...state, applied: { setRefs, unsetRefs, warnings, usage: appliedUsage } })
 }
 
 /**

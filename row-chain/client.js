@@ -1,9 +1,11 @@
 /**
- * 配置卡片（浏览器半边）：侧栏 Plugins → dsh-websearch-tavily-keys-select 包页上的那张表单。
+ * 配置卡片（浏览器半边）：侧栏 Plugins → bundle 包页上的那张表单。
  *
- * 注册进 `plugins.bundle.config`，键 = **bundle 包的包名** `dsh-websearch-tavily-keys-select`
- * （宿主侧 `configured = ledger.bundles.has(pkg.name)` 用的就是这个名字，写错一个字符整块不渲染；
- * 改包名时必须同步改这里的 `ENTRY_KEY`，`test/verify-client.mjs` 有动态守卫）。
+ * 注册进 `plugins.bundle.config`，键 = **bundle 包的包名**（宿主侧 `configured = ledger.bundles.has(pkg.name)`
+ * 用的就是这个名字，写错一个字符整块不渲染；改包名时必须同步改这里的 `ENTRY_KEY`，
+ * `test/verify-client.mjs` 有动态守卫）。当前正本包名是 `dsh-websearch-tavily-keys-select`，
+ * 而本机 profile 里部署的是它的旧名 `dsh-web-search-chain` —— 两个名字由 `sync-to-profile.mjs`
+ * 的 live 布局负责改写，**不要手改**。
  *
  * ⚠️ 三条硬约束：
  * 1. **只 require 基座**（react / react/jsx-runtime）。官方 practices 明文禁止 client 半边
@@ -13,6 +15,8 @@
  *    必须 active」的全有全无启动门禁 ⇒ 整机起不来。故 entry 级 inject 为空 + 嵌套注入
  *    slots + 每处 try/catch + 最外层兜底。
  * 3. 明文**只出现在 POST 请求体里**；读回来的一律是 `{configured, source, writable}` 状态。
+ *    SecretId 例外：它不是机密（腾讯云的原话是"类比用户名"），明文存在配置文档里、界面可改；
+ *    真正的机密 SecretKey 走环境变量或凭据域。
  */
 window.__ModuleLoader__.load({
 	id: "dsh-search-chain",
@@ -31,6 +35,8 @@ window.__ModuleLoader__.load({
 		const ENTRY_KEY = "dsh-websearch-tavily-keys-select";
 		const MAX_SOURCES = 3;
 		const REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+		/** SecretId 的宽松校验（与 core.mjs 的 SECRET_ID_PATTERN 保持一致）。 */
+		const SECRET_ID_PATTERN = /^\S{6,128}$/;
 
 		//#region 文案（中文为准；只有语言明确是英文才切英文）
 		const COPY = {
@@ -54,7 +60,7 @@ window.__ModuleLoader__.load({
 				sourceStore: "来源：已存储",
 				remove: "删除",
 				recycle: (refs) => `保存后将同时移除已存储的密钥：${refs.join("、")}`,
-				add: "添加搜索源",
+				addTemplate: (label) => `添加：${label}`,
 				addLimit: (max) => `已达上限 ${max} 个`,
 				fallback: "官方搜索（兜底）",
 				fallbackOn: "已启用",
@@ -67,6 +73,23 @@ window.__ModuleLoader__.load({
 				needRef: "每个「环境变量」源都要填一个变量名（形如 TAVILY_API_KEY）。",
 				needUniqueRef: "两个源不能填同一个变量名。",
 				configBroken: "配置文件损坏，当前按默认值工作：",
+				secretId: "SecretId",
+				secretIdHint: "SecretId 明文存在配置文件里（可随时改）；SecretKey 用上面的环境变量或下面的明文框。",
+				needSecretId: "元宝搜索源必须填 SecretId（形如 AKID… 的腾讯云 API 密钥）。",
+				budget: "额度",
+				budgetMonthly: "每月",
+				budgetReserve: "保留",
+				budgetUnit: "次",
+				budgetHint: "留空表示用默认额度（日常 2000 次/月，活动期 6000 次）",
+				badBudget: "额度要填非负整数，且「保留」不能大于「每月」。",
+				usedLabel: "本月已用",
+				usedCalibrate: "（可改，用于和腾讯云控制台对账）",
+				badUsed: "「本月已用」必须是非负整数。",
+				usageUnlimited: (used) => `本月已用 ${used} 次（未设上限）`,
+				usageLine: (used, monthly, remaining) => `本月已用 ${used} / ${monthly} 次 · 还剩 ${remaining}`,
+				usageReserve: (reserve) => ` · 其中 ${reserve} 次作为余量不使用`,
+				usagePromo: (monthly, until) => ` · 活动额度 ${monthly} 次（至 ${until}，到期自动降回日常额度）`,
+				usageExhausted: "额度已用完，这条源会被跳过（不会超额计费）",
 			},
 			en: {
 				title: "Web search chain",
@@ -88,7 +111,7 @@ window.__ModuleLoader__.load({
 				sourceStore: "stored",
 				remove: "Remove",
 				recycle: (refs) => `Saving will also remove the stored key(s): ${refs.join(", ")}`,
-				add: "Add a source",
+				addTemplate: (label) => `Add: ${label}`,
 				addLimit: (max) => `Limit reached (${max})`,
 				fallback: "Official search (fallback)",
 				fallbackOn: "enabled",
@@ -101,6 +124,23 @@ window.__ModuleLoader__.load({
 				needRef: "Every environment-variable source needs a variable name (for example TAVILY_API_KEY).",
 				needUniqueRef: "Two sources cannot use the same variable name.",
 				configBroken: "The configuration file is unreadable; defaults are in effect: ",
+				secretId: "SecretId",
+				secretIdHint: "The SecretId is stored in plain text in the configuration file (editable); the SecretKey comes from the environment variable above or the field below.",
+				needSecretId: "A Yuanbao source needs a SecretId (a Tencent Cloud API key such as AKID…).",
+				budget: "Quota",
+				budgetMonthly: "per month",
+				budgetReserve: "reserve",
+				budgetUnit: "calls",
+				budgetHint: "Leave blank to use the defaults (2000 calls/month, 6000 during the promotion).",
+				badBudget: "The quota must be a non-negative integer, and the reserve cannot exceed the monthly quota.",
+				usedLabel: "Used this month",
+				usedCalibrate: "(editable, for reconciling with the Tencent Cloud console)",
+				badUsed: "“Used this month” must be a non-negative integer.",
+				usageUnlimited: (used) => `${used} calls used this month (no cap)`,
+				usageLine: (used, monthly, remaining) => `${used} / ${monthly} calls used this month · ${remaining} left`,
+				usageReserve: (reserve) => ` · ${reserve} calls held back as a reserve`,
+				usagePromo: (monthly, until) => ` · promotion quota ${monthly} calls (until ${until}, then back to the regular quota)`,
+				usageExhausted: "Quota exhausted — this source is skipped (no overage billing)",
 			},
 		};
 		const copy = typeof navigator !== "undefined" && /^en\b/i.test(String(navigator.language ?? "")) ? COPY.en : COPY.zh;
@@ -157,17 +197,40 @@ window.__ModuleLoader__.load({
 		function emptyState() {
 			return { status: "loading", error: null, state: null, draft: null, saving: false, notice: null };
 		}
+		/**
+		 * 数字输入 → 非负整数；空串/非数字 → null（`null` 与 0 必须分得开：
+		 * 空额度表示"用默认值"，额度 0 表示"不限"）。
+		 */
+		function toInteger(value) {
+			if (typeof value === "number") return Number.isInteger(value) && value >= 0 ? value : null;
+			const text = String(value ?? "").trim();
+			if (text.length === 0 || !/^\d+$/.test(text)) return null;
+			const parsed = Number(text);
+			return Number.isSafeInteger(parsed) ? parsed : null;
+		}
 		/** 服务端状态 → 草稿（每个源带上 secret 输入框的初始值 ""）。 */
 		function draftFromState(state) {
-			const sources = (state?.sources ?? []).map((source) => ({
-				id: source.id,
-				kind: source.kind,
-				mode: source.mode,
-				ref: source.ref,
-				serverMode: source.mode,
-				credential: source.credential ?? { configured: false, writable: true },
-				secret: "",
-			}));
+			const sources = (state?.sources ?? []).map((source) => {
+				const budget = source.budget ?? null;
+				const usage = source.usage ?? null;
+				const used = usage !== null && Number.isInteger(usage.used) ? usage.used : 0;
+				return {
+					id: source.id,
+					kind: source.kind,
+					mode: source.mode,
+					ref: source.ref,
+					serverMode: source.mode,
+					credential: source.credential ?? { configured: false, writable: true },
+					secret: "",
+					secretId: typeof source.secretId === "string" ? source.secretId : "",
+					budgetMonthly: budget === null ? "" : String(budget.monthly),
+					budgetReserve: budget === null ? "" : String(budget.reserve ?? 0),
+					promo: budget?.promo ?? null,
+					usage,
+					used: String(used),
+					serverUsed: used,
+				};
+			});
 			return { sources };
 		}
 		/** 只改第 index 个源的一个字段，返回新草稿（绝不原地改）。 */
@@ -187,13 +250,36 @@ window.__ModuleLoader__.load({
 		function setSecret(draft, index, secret) {
 			return patchSource(draft, index, { secret });
 		}
+		/** 改 yuanbao 源的 SecretId（明文、可随时换）。 */
+		function setSecretId(draft, index, secretId) {
+			return patchSource(draft, index, { secretId });
+		}
+		/** 改额度的一个字段：`field` 是 `"budgetMonthly"` 或 `"budgetReserve"`。 */
+		function setBudget(draft, index, field, value) {
+			if (field !== "budgetMonthly" && field !== "budgetReserve") return draft;
+			return patchSource(draft, index, { [field]: value });
+		}
+		/** 改「本月已用」（校准用，不是本地计数器本身）。 */
+		function setUsed(draft, index, used) {
+			return patchSource(draft, index, { used });
+		}
 		function removeSource(draft, index) {
 			return { sources: draft.sources.filter((_, at) => at !== index) };
 		}
-		/** 追加一个源（模板取表内第一项 = Tavily；默认「环境变量」模式 + 空变量名）。 */
-		function addSource(draft, templates) {
+		/** 模板默认预算（服务端 `state.defaults.budgets[kind]`）。 */
+		function templateBudget(state, kind) {
+			const budget = state?.defaults?.budgets?.[kind];
+			return budget === undefined ? null : budget;
+		}
+		/**
+		 * 追加一个源：`kind` 指定模板（缺省取表内第一项）。
+		 * 新 yuanbao 源把**模板默认额度**预填进输入框，这样它和"不填"的语义一致（含活动额度）。
+		 */
+		function addSource(draft, templates, kind, state) {
 			if (draft.sources.length >= MAX_SOURCES) return draft;
-			const template = (templates ?? [])[0] ?? { kind: "tavily" };
+			const table = templates ?? [];
+			const template = table.find((candidate) => candidate.kind === kind) ?? table[0] ?? { kind: "tavily" };
+			const budget = templateBudget(state, template.kind);
 			return {
 				sources: [
 					...draft.sources,
@@ -205,9 +291,30 @@ window.__ModuleLoader__.load({
 						serverMode: undefined,
 						credential: { configured: false, writable: true },
 						secret: "",
+						secretId: "",
+						budgetMonthly: budget === null ? "" : String(budget.monthly),
+						budgetReserve: budget === null ? "" : String(budget.reserve ?? 0),
+						promo: budget?.promo ?? null,
+						usage: null,
+						used: "0",
+						serverUsed: 0,
 					},
 				],
 			};
+		}
+		/**
+		 * 草稿里的额度 → 提交用的预算对象。
+		 * 空输入 = `null`（**不带这个字段** ⇒ 服务端用模板默认额度）；
+		 * 活动额度 `promo` 原样带回，避免"改一下每月额度就把活动额度弄丢"。
+		 */
+		function budgetOf(source) {
+			const monthly = toInteger(source?.budgetMonthly);
+			if (monthly === null) return null;
+			const reserve = toInteger(source?.budgetReserve ?? "0");
+			if (reserve === null) return null;
+			const budget = { monthly, reserve };
+			if (source?.promo !== null && source?.promo !== undefined) budget.promo = source.promo;
+			return budget;
 		}
 		/** 草稿 → POST 请求体：只带真正要提交的字段（空 secret 不带、缺 id 不带）。 */
 		function toRequest(draft) {
@@ -217,19 +324,48 @@ window.__ModuleLoader__.load({
 					if (typeof source.id === "string" && source.id.length > 0) row.id = source.id;
 					if (source.mode === "env") row.ref = String(source.ref ?? "").trim();
 					if (source.mode === "literal" && typeof source.secret === "string" && source.secret.length > 0) row.secret = source.secret;
+					if (source.kind === "yuanbao") {
+						row.secretId = String(source.secretId ?? "").trim();
+						const budget = budgetOf(source);
+						if (budget !== null) row.budget = budget;
+					}
 					return row;
 				}),
 			};
+		}
+		/**
+		 * 需要校准的「本月已用」：只带**用户改过的**那些（否则每次保存都会把本地计数器
+		 * 回写成页面打开时的旧值，等于把刚发生的调用抹掉）。
+		 */
+		function usagePatchOf(state, draft) {
+			const patch = {};
+			for (const source of draft?.sources ?? []) {
+				if (typeof source.id !== "string" || source.id.length === 0) continue;
+				const used = toInteger(source.used);
+				if (used === null) continue;
+				if (used !== source.serverUsed) patch[source.id] = used;
+			}
+			return patch;
 		}
 		/** 客户端预校验：返回第一条人话问题，没有就 null（省一次注定失败的往返）。 */
 		function firstProblem(draft) {
 			const seen = new Set();
 			for (const source of draft.sources) {
-				if (source.mode !== "env") continue;
-				const ref = String(source.ref ?? "").trim();
-				if (ref.length === 0 || !REF_PATTERN.test(ref)) return copy.needRef;
-				if (seen.has(ref)) return copy.needUniqueRef;
-				seen.add(ref);
+				if (source.mode === "env") {
+					const ref = String(source.ref ?? "").trim();
+					if (ref.length === 0 || !REF_PATTERN.test(ref)) return copy.needRef;
+					if (seen.has(ref)) return copy.needUniqueRef;
+					seen.add(ref);
+				}
+				if (source.kind === "yuanbao") {
+					const secretId = String(source.secretId ?? "").trim();
+					if (!SECRET_ID_PATTERN.test(secretId)) return copy.needSecretId;
+					const budget = budgetOf(source);
+					if (budget === null) return copy.badBudget;
+					if (budget.monthly === 0 ? budget.reserve !== 0 : budget.reserve > budget.monthly) return copy.badBudget;
+				}
+				const used = String(source.used ?? "").trim();
+				if (used.length > 0 && toInteger(used) === null) return copy.badUsed;
 			}
 			return null;
 		}
@@ -264,15 +400,31 @@ window.__ModuleLoader__.load({
 			}
 			return copy.unconfigured;
 		}
+		/** 额度那一行的人话（`usage` 来自服务端，随保存刷新）。 */
+		function usageText(usage) {
+			if (usage === null || usage === undefined) return "";
+			const used = Number.isInteger(usage.used) ? usage.used : 0;
+			if (usage.unlimited === true || usage.monthly === null) return copy.usageUnlimited(used);
+			const parts = [copy.usageLine(used, usage.monthly, usage.remaining ?? 0)];
+			if (Number.isInteger(usage.reserve) && usage.reserve > 0) parts.push(copy.usageReserve(usage.reserve));
+			if (usage.promo !== null && usage.promo !== undefined && usage.promo.active === true) {
+				parts.push(copy.usagePromo(usage.promo.monthly, usage.promo.until));
+			}
+			return `${parts.join("")}${usage.exhausted === true ? ` · ${copy.usageExhausted}` : ""}`;
+		}
 		/** 摘要视图那一行（state 还没到时也要稳）。 */
 		function summaryText(snapshot) {
 			const state = snapshot?.state;
 			if (state === null || state === undefined) return copy.loading;
 			const enabled = state.fallback?.enabled === true;
-			return `${copy.title} · ${state.sources.length} 个源 · ${copy.fallback} ${enabled ? copy.fallbackOn : copy.fallbackOff}`;
+			const quota = (state.sources ?? [])
+				.filter((source) => source.kind === "yuanbao" && source.usage !== null && source.usage !== undefined)
+				.map((source) => `元宝 ${source.usage.used}/${source.usage.monthly ?? "∞"}`)
+				.join(" · ");
+			return `${copy.title} · ${state.sources.length} 个源${quota.length > 0 ? ` · ${quota}` : ""} · ${copy.fallback} ${enabled ? copy.fallbackOn : copy.fallbackOff}`;
 		}
 		/**
-		 * 编辑动作：`{kind:"mode"|"ref"|"secret"|"remove"|"add", index?, value?}`。
+		 * 编辑动作：`{kind:"mode"|"ref"|"secret"|"secretId"|"budget"|"used"|"remove"|"add", index?, value?, field?}`。
 		 * 所有改动都走这里 → 逻辑不散在 React 里，验证台能直接断言。
 		 */
 		function applyEdit(store, action) {
@@ -289,11 +441,20 @@ window.__ModuleLoader__.load({
 					case "secret":
 						shell.draft = setSecret(current, action.index, action.value);
 						break;
+					case "secretId":
+						shell.draft = setSecretId(current, action.index, action.value);
+						break;
+					case "budget":
+						shell.draft = setBudget(current, action.index, action.field, action.value);
+						break;
+					case "used":
+						shell.draft = setUsed(current, action.index, action.value);
+						break;
 					case "remove":
 						shell.draft = removeSource(current, action.index);
 						break;
 					case "add":
-						shell.draft = addSource(current, shell.state?.templates ?? []);
+						shell.draft = addSource(current, shell.state?.templates ?? [], action.value, shell.state);
 						break;
 					default:
 						return;
@@ -320,7 +481,9 @@ window.__ModuleLoader__.load({
 			modeLine: { color: TOKEN.label, fontSize: 13, display: "inline-flex", alignItems: "center", gap: 6 },
 			field: { display: "flex", alignItems: "center", gap: 8, marginLeft: 22, color: TOKEN.label, fontSize: 13 },
 			input: { flex: 1, minWidth: 0, fontSize: 13, padding: "4px 8px", border: `0.5px solid ${TOKEN.border}`, borderRadius: 6, background: "transparent", color: TOKEN.label },
+			number: { width: 88, fontSize: 13, padding: "4px 8px", border: `0.5px solid ${TOKEN.border}`, borderRadius: 6, background: "transparent", color: TOKEN.label },
 			hint: { color: TOKEN.tertiary, fontSize: 12, margin: "0 0 0 22px" },
+			budgetLine: { display: "flex", alignItems: "center", gap: 8, marginLeft: 22, color: TOKEN.label, fontSize: 13, flexWrap: "wrap" },
 			tag: { fontSize: 11, padding: "1px 6px", borderRadius: 10, border: `0.5px solid ${TOKEN.border}`, color: TOKEN.tertiary, whiteSpace: "nowrap" },
 			fallback: { display: "flex", alignItems: "center", gap: 8, color: TOKEN.tertiary, fontSize: 13, borderTop: `0.5px solid ${TOKEN.border}`, paddingTop: 10 },
 			footer: { display: "flex", justifyContent: "flex-end", gap: 8 },
@@ -343,14 +506,14 @@ window.__ModuleLoader__.load({
 				],
 			});
 		}
-		/** 自包含文本输入（`type` 可传 `password`）。 */
+		/** 自包含文本输入（`type` 可传 `password` / `number`）。 */
 		function AtomInput(props) {
 			return jsx("input", {
 				type: props.type ?? "text",
 				value: props.value ?? "",
 				placeholder: props.placeholder ?? "",
 				disabled: props.disabled === true,
-				style: { ...S.input, opacity: props.disabled === true ? 0.55 : 1 },
+				style: { ...(props.narrow === true ? S.number : S.input), opacity: props.disabled === true ? 0.55 : 1 },
 				onChange: (event) => props.onChange(event.target.value),
 			});
 		}
@@ -382,6 +545,73 @@ window.__ModuleLoader__.load({
 		//#endregion
 
 		//#region 卡片
+		/** 元宝搜索源独有的三段：SecretId / 额度 / 本月已用（校准）。 */
+		function renderYuanbaoExtras(source, index, props) {
+			return [
+				jsxs(
+					"div",
+					{
+						style: S.field,
+						children: [
+							jsx("span", { children: copy.secretId }),
+							jsx(AtomInput, {
+								value: source.secretId,
+								placeholder: "AKID…",
+								onChange: (value) => props.edit({ kind: "secretId", index, value }),
+							}),
+						],
+					},
+					`secretId-${index}`,
+				),
+				jsx("p", { style: S.hint, children: copy.secretIdHint }, `secretIdHint-${index}`),
+				jsxs(
+					"div",
+					{
+						style: S.budgetLine,
+						children: [
+							jsx("span", { children: copy.budget }),
+							jsx("span", { children: copy.budgetMonthly }),
+							jsx(AtomInput, {
+								narrow: true,
+								type: "number",
+								value: source.budgetMonthly,
+								placeholder: "2000",
+								onChange: (value) => props.edit({ kind: "budget", field: "budgetMonthly", index, value }),
+							}),
+							jsx("span", { children: copy.budgetUnit }),
+							jsx("span", { children: copy.budgetReserve }),
+							jsx(AtomInput, {
+								narrow: true,
+								type: "number",
+								value: source.budgetReserve,
+								placeholder: "100",
+								onChange: (value) => props.edit({ kind: "budget", field: "budgetReserve", index, value }),
+							}),
+							jsx("span", { children: copy.budgetUnit }),
+						],
+					},
+					`budget-${index}`,
+				),
+				jsxs(
+					"div",
+					{
+						style: S.budgetLine,
+						children: [
+							jsx("span", { children: copy.usedLabel }),
+							jsx(AtomInput, {
+								narrow: true,
+								type: "number",
+								value: source.used,
+								onChange: (value) => props.edit({ kind: "used", index, value }),
+							}),
+							jsx("span", { style: { color: TOKEN.tertiary, fontSize: 12 }, children: copy.usedCalibrate }),
+						],
+					},
+					`used-${index}`,
+				),
+				jsx("p", { style: S.hint, children: usageText(source.usage) }, `usage-${index}`),
+			];
+		}
 		/** 一个源的渲染：模板 + 两个互斥 checkbox + 对应输入框 + 删除。 */
 		function renderSourceRow(source, index, templates, props) {
 			const kind = source.kind;
@@ -401,6 +631,7 @@ window.__ModuleLoader__.load({
 								jsx(AtomButton, { children: copy.remove, onClick: () => props.edit({ kind: "remove", index }) }),
 							],
 						}),
+						...(kind === "yuanbao" ? renderYuanbaoExtras(source, index, props) : []),
 						jsx(AtomCheckbox, {
 							checked: isEnv,
 							label: copy.modeEnv,
@@ -469,6 +700,7 @@ window.__ModuleLoader__.load({
 			const state = snapshot.state;
 			const problem = firstProblem(draft);
 			const atLimit = draft.sources.length >= MAX_SOURCES;
+			const templates = state?.templates ?? [];
 			const recycling = recycledRefs(state, draft);
 			return jsxs("div", {
 				style: S.card,
@@ -477,13 +709,20 @@ window.__ModuleLoader__.load({
 					typeof state?.configError === "string" && state.configError.length > 0
 						? jsx("p", { style: S.banner, children: `${copy.configBroken}${state.configError}` })
 						: null,
-					...draft.sources.map((source, index) => renderSourceRow(source, index, state?.templates, props)),
+					...draft.sources.map((source, index) => renderSourceRow(source, index, templates, props)),
 					jsx("div", {
-						children: jsx(AtomButton, {
-							children: atLimit ? copy.addLimit(MAX_SOURCES) : copy.add,
-							disabled: atLimit,
-							onClick: () => props.edit({ kind: "add" }),
-						}),
+						style: { display: "flex", gap: 8, flexWrap: "wrap" },
+						children: (templates.length > 0 ? templates : [{ kind: "tavily", label: "Tavily Key" }]).map((template) =>
+							jsx(
+								AtomButton,
+								{
+									children: atLimit ? copy.addLimit(MAX_SOURCES) : copy.addTemplate(template.label),
+									disabled: atLimit,
+									onClick: () => props.edit({ kind: "add", value: template.kind }),
+								},
+								`add-${template.kind}`,
+							),
+						),
 					}),
 					renderFallback(state),
 					recycling.length > 0 ? jsx("p", { style: S.banner, children: copy.recycle(recycling) }) : null,
@@ -562,7 +801,7 @@ window.__ModuleLoader__.load({
 				response = await fetch(CONFIG_PATH, {
 					method: "POST",
 					headers: { "content-type": "application/json" },
-					body: JSON.stringify(toRequest(snapshot.draft)),
+					body: JSON.stringify({ ...toRequest(snapshot.draft), usage: usagePatchOf(snapshot.state, snapshot.draft) }),
 				});
 				payload = await response.json().catch(() => void 0);
 			} catch (error) {
@@ -649,12 +888,19 @@ window.__ModuleLoader__.load({
 			setMode,
 			setRef,
 			setSecret,
+			setSecretId,
+			setBudget,
+			setUsed,
 			removeSource,
 			addSource,
+			toInteger,
+			budgetOf,
 			toRequest,
+			usagePatchOf,
 			firstProblem,
 			secretDisabled,
 			credentialText,
+			usageText,
 			recycledRefs,
 			summaryText,
 			applyEdit,

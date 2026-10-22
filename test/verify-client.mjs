@@ -177,22 +177,48 @@ check('注册用了 inject 面（hooks + 4 个动作）', (() => {
 }
 
 // ── 纯逻辑：草稿 ──────────────────────────────────────────────────
+const YUANBAO_BUDGET = { monthly: 2000, reserve: 100, promo: { monthly: 6000, until: '2026-11-30' } }
 const SERVER_STATE = {
 	ok: true,
-	version: 1,
+	version: 2,
 	maxSources: 3,
-	templates: [{ kind: 'tavily', label: 'Tavily Key', refExample: 'TAVILY_API_KEY' }],
+	templates: [
+		{ kind: 'yuanbao', label: '腾讯元宝搜索', refExample: 'TENCENTCLOUD_SECRET_KEY' },
+		{ kind: 'tavily', label: 'Tavily Key', refExample: 'TAVILY_API_KEY' },
+	],
+	defaults: { budgets: { yuanbao: YUANBAO_BUDGET, tavily: null } },
 	sources: [
-		{ id: 's1', kind: 'tavily', mode: 'env', ref: 'TAVILY_API_KEY2', credential: { configured: true, source: 'environment', writable: false } },
-		{ id: 's2', kind: 'tavily', mode: 'literal', ref: 'WEB_SEARCH_TAVILY_1', credential: { configured: true, source: 'store', writable: true } },
+		{
+			id: 's1',
+			kind: 'yuanbao',
+			mode: 'env',
+			ref: 'TENCENTCLOUD_SECRET_KEY',
+			secretId: 'AKIDtestSecretId0000000000000000',
+			budget: YUANBAO_BUDGET,
+			credential: { configured: true, source: 'environment', writable: false },
+			usage: { month: '2026-10', unlimited: false, monthly: 6000, reserve: 100, used: 12, remaining: 5888, exhausted: false, promo: { monthly: 6000, until: '2026-11-30', active: true } },
+		},
+		{
+			id: 's2',
+			kind: 'tavily',
+			mode: 'literal',
+			ref: 'WEB_SEARCH_TAVILY_1',
+			budget: null,
+			credential: { configured: true, source: 'store', writable: true },
+			usage: { month: '2026-10', unlimited: true, monthly: null, reserve: 0, used: 0, remaining: null, exhausted: false, promo: null },
+		},
 	],
 	fallback: { kind: 'deepseek', enabled: true },
 	configError: null,
+	usageError: null,
 }
 const draft = I.draftFromState(SERVER_STATE)
-check('draftFromState：逐字带出 4 个字段 + 空 secret + serverMode', eq(
-	draft.sources.map((s) => [s.id, s.kind, s.mode, s.ref, s.secret, s.serverMode]),
-	[['s1', 'tavily', 'env', 'TAVILY_API_KEY2', '', 'env'], ['s2', 'tavily', 'literal', 'WEB_SEARCH_TAVILY_1', '', 'literal']],
+check('draftFromState：带出 id/kind/mode/ref/serverMode/secret + secretId + 额度 + 用量', eq(
+	draft.sources.map((s) => [s.id, s.kind, s.mode, s.ref, s.secret, s.serverMode, s.secretId, s.budgetMonthly, s.budgetReserve, s.used, s.serverUsed]),
+	[
+		['s1', 'yuanbao', 'env', 'TENCENTCLOUD_SECRET_KEY', '', 'env', 'AKIDtestSecretId0000000000000000', '2000', '100', '12', 12],
+		['s2', 'tavily', 'literal', 'WEB_SEARCH_TAVILY_1', '', 'literal', '', '', '', '0', 0],
+	],
 ))
 check('draftFromState：state 为 null 也不抛', eq(I.draftFromState(null).sources, []))
 
@@ -203,16 +229,30 @@ check('setMode：checkbox 互斥（模式是单值，不可能两个都勾）', 
 })())
 check('setMode/setRef/setSecret 不原地改（返回新草稿）', (() => {
 	const next = I.setRef(draft, 0, 'OTHER')
-	return draft.sources[0].ref === 'TAVILY_API_KEY2' && next.sources[0].ref === 'OTHER' && next !== draft
+	return draft.sources[0].ref === 'TENCENTCLOUD_SECRET_KEY' && next.sources[0].ref === 'OTHER' && next !== draft
 })())
-check('addSource：默认 env + 空变量名 + 模板取表内第一项', (() => {
-	const next = I.addSource(draft, SERVER_STATE.templates)
+check('setSecretId / setBudget / setUsed：只改目标源的目标字段', (() => {
+	const a = I.setSecretId(draft, 0, 'AKIDnew')
+	const b = I.setBudget(a, 0, 'budgetMonthly', '3000')
+	const c = I.setBudget(b, 0, 'budgetReserve', '0')
+	const d = I.setUsed(c, 1, '7')
+	return d.sources[0].secretId === 'AKIDnew' && d.sources[0].budgetMonthly === '3000' && d.sources[0].budgetReserve === '0' && d.sources[1].used === '7' && d.sources[0].used === '12'
+})())
+check('setBudget：非法字段名不动草稿（白名单）', eq(I.setBudget(draft, 0, 'budgetHack', '1'), draft))
+
+check('addSource(yuanbao)：用模板默认额度预填（含活动额度），env + 空变量名', (() => {
+	const next = I.addSource(draft, SERVER_STATE.templates, 'yuanbao', SERVER_STATE)
 	const added = next.sources.at(-1)
-	return next.sources.length === 3 && added.mode === 'env' && added.ref === '' && added.kind === 'tavily'
+	return next.sources.length === 3 && added.kind === 'yuanbao' && added.mode === 'env' && added.ref === '' && added.budgetMonthly === '2000' && added.budgetReserve === '100' && eq(added.promo, YUANBAO_BUDGET.promo)
+})())
+check('addSource(tavily)：不预填额度（null 默认）', (() => {
+	const next = I.addSource(draft, SERVER_STATE.templates, 'tavily', SERVER_STATE)
+	const added = next.sources.at(-1)
+	return added.kind === 'tavily' && added.budgetMonthly === '' && added.promo === null
 })())
 check('addSource：到上限就不再追加（按钮与逻辑两层都挡）', (() => {
 	const full = { sources: [0, 1, 2].map((n) => ({ id: `s${n}`, kind: 'tavily', mode: 'env', ref: `K${n}`, secret: '' })) }
-	assertSame(I.addSource(full, SERVER_STATE.templates), full)
+	if (!eq(I.addSource(full, SERVER_STATE.templates, 'tavily', SERVER_STATE), full)) throw new Error('追加了第 4 个源')
 	return true
 })())
 check('removeSource：按下标删且保持其它源顺序', (() => {
@@ -235,6 +275,34 @@ check('toRequest：env 源带 trim 后的 ref；不带空 secret；缺 id 就不
 		],
 	})
 })())
+check('toRequest：yuanbao 源带 secretId + budget（原样带回活动额度）', (() => {
+	const next = I.toRequest({ sources: [draft.sources[0]] })
+	return eqShape(next, {
+		sources: [
+			{
+				kind: 'yuanbao',
+				mode: 'env',
+				ref: 'TENCENTCLOUD_SECRET_KEY',
+				id: 's1',
+				secretId: 'AKIDtestSecretId0000000000000000',
+				budget: { monthly: 2000, reserve: 100, promo: { monthly: 6000, until: '2026-11-30' } },
+			},
+		],
+	})
+})())
+check('usagePatchOf：只带用户改过的「本月已用」', (() => {
+	const steady = I.usagePatchOf(SERVER_STATE, I.draftFromState(SERVER_STATE))
+	const changed = I.usagePatchOf(SERVER_STATE, I.setUsed(I.draftFromState(SERVER_STATE), 0, '99'))
+	const cleared = I.usagePatchOf(SERVER_STATE, I.setUsed(I.draftFromState(SERVER_STATE), 0, ''))
+	return eq(steady, {}) && eq(changed, { s1: 99 }) && eq(cleared, {})
+})())
+check('toInteger：空串/负数/小数/垃圾 ⇒ null（空额度 ≠ 额度 0）', (() => {
+	return I.toInteger('') === null && I.toInteger('12') === 12 && I.toInteger(0) === 0 && I.toInteger('-1') === null && I.toInteger('1.5') === null && I.toInteger('x') === null
+})())
+check('budgetOf：空额度 ⇒ null（不带字段）；非法 ⇒ null；0 保留', (() => {
+	const base = { budgetMonthly: '', budgetReserve: '', promo: null }
+	return I.budgetOf(base) === null && I.budgetOf({ ...base, budgetMonthly: '2000', budgetReserve: '100' }) !== null && I.budgetOf({ budgetMonthly: '0', budgetReserve: '0', promo: null }).monthly === 0 && I.budgetOf({ budgetMonthly: 'x', budgetReserve: '0', promo: null }) === null
+})())
 check('firstProblem：空变量名 ⇒ 提示；填好 ⇒ null', (() => {
 	const bad = { sources: [{ kind: 'tavily', mode: 'env', ref: '  ' }] }
 	const good = { sources: [{ kind: 'tavily', mode: 'env', ref: 'K1' }, { kind: 'tavily', mode: 'literal' }] }
@@ -248,6 +316,13 @@ check('firstProblem：非法的变量名 ⇒ 提示', (() => {
 	const bad = { sources: [{ kind: 'tavily', mode: 'env', ref: '1BAD' }] }
 	return I.firstProblem(bad) !== null
 })())
+check('firstProblem：yuanbao 缺 SecretId ⇒ 提示；额度倒挂 ⇒ 提示；填好 ⇒ null', (() => {
+	const missing = { sources: [{ kind: 'yuanbao', mode: 'env', ref: 'K1', secretId: '', budgetMonthly: '2000', budgetReserve: '100', promo: null, used: '0' }] }
+	const inverted = { sources: [{ kind: 'yuanbao', mode: 'env', ref: 'K1', secretId: 'AKIDxxxxxxxx', budgetMonthly: '10', budgetReserve: '11', promo: null, used: '0' }] }
+	const fine = { sources: [{ kind: 'yuanbao', mode: 'env', ref: 'K1', secretId: 'AKIDxxxxxxxx', budgetMonthly: '2000', budgetReserve: '100', promo: null, used: '0' }] }
+	const badUsed = { sources: [{ kind: 'yuanbao', mode: 'env', ref: 'K1', secretId: 'AKIDxxxxxxxx', budgetMonthly: '2000', budgetReserve: '100', promo: null, used: '-3' }] }
+	return I.firstProblem(missing) !== null && I.firstProblem(inverted) !== null && I.firstProblem(fine) === null && I.firstProblem(badUsed) !== null
+})())
 check('secretDisabled：只有「服务端已是 literal 且只读」才置灰', (() => {
 	const envish = { mode: 'literal', serverMode: 'env', credential: { writable: false } }
 	const shadowed = { mode: 'literal', serverMode: 'literal', credential: { writable: false } }
@@ -260,15 +335,16 @@ check('recycledRefs：常态（仍是 literal）不误报；切走与删除都�
 	const deleted = I.recycledRefs(SERVER_STATE, I.removeSource(I.draftFromState(SERVER_STATE), 1))
 	return eq(steady, []) && eq(switched, ['WEB_SEARCH_TAVILY_1']) && eq(deleted, ['WEB_SEARCH_TAVILY_1'])
 })())
-check('summaryText：state 为 null 也不抛；有 state 时带源数量与兜底状态', (() => {
+check('usageText：活动期显示已用/额度/剩余 + 活动额度提示；不限额度另有文案', (() => {
+	const promo = I.usageText(SERVER_STATE.sources[0].usage)
+	const unlimited = I.usageText(SERVER_STATE.sources[1].usage)
+	return promo.includes('12 / 6000') && promo.includes('5888') && promo.includes('2026-11-30') && unlimited.includes('未设上限')
+})())
+check('summaryText：state 为 null 也不抛；有 state 时带源数量、元宝用量与兜底状态', (() => {
 	const whenLoading = I.summaryText({ state: null })
 	const whenReady = I.summaryText({ state: SERVER_STATE })
-	return typeof whenLoading === 'string' && whenReady.includes('2') && whenReady.includes('已启用')
+	return typeof whenLoading === 'string' && whenReady.includes('2 个源') && whenReady.includes('元宝 12/6000') && whenReady.includes('已启用')
 })())
-
-function assertSame(actual, expected) {
-	if (!eq(actual, expected)) throw new Error(`不等：${JSON.stringify(actual)}`)
-}
 
 // ── 卡片渲染（展开全部自包含原子，断言真实 DOM 形状）──────────────
 function expandAll(node) {
@@ -306,17 +382,23 @@ face.hooks.webSearchChain.set({ status: 'ready', error: null, state: SERVER_STAT
 	const checked = checkboxes.filter((el) => el.props.checked === true)
 	const passwords = findAll(tree, (el) => el.type === 'input' && el.props?.type === 'password')
 	const inputs = findAll(tree, (el) => el.type === 'input')
+	const numbers = findAll(tree, (el) => el.type === 'input' && el.props?.type === 'number')
 	check('渲染：每个源一对 checkbox（2 源 = 4 个）', checkboxes.length === 4, String(checkboxes.length))
 	check('渲染：每个源恰好勾中一个（互斥）', checked.length === 2, String(checked.length))
 	check('渲染：literal 源有密码输入框（1 个）', passwords.length === 1, String(passwords.length))
-	check('渲染：env 源的变量名输入框显示 ref', inputs.some((el) => el.props.value === 'TAVILY_API_KEY2'))
+	check('渲染：env 源的变量名输入框显示 ref', inputs.some((el) => el.props.value === 'TENCENTCLOUD_SECRET_KEY'))
+	check('渲染：yuanbao 源显示 SecretId（可改，明文）', inputs.some((el) => el.props.value === 'AKIDtestSecretId0000000000000000'))
+	check('渲染：额度两个数字输入框（每月 / 保留）', numbers.some((el) => el.props.value === '2000') && numbers.some((el) => el.props.value === '100'))
+	check('渲染：本月已用可校准（数字输入框显示 12）', numbers.some((el) => el.props.value === '12'))
+	check('渲染：额度状态行显示「本月已用 12 / 6000」', JSON.stringify(tree).includes('本月已用 12 / 6000'))
 	check('渲染：兜底行显示「已启用」', JSON.stringify(tree).includes('已启用'))
 	check('渲染：明文已配置时用「留空即保持不变」占位', inputs.some((el) => String(el.props.placeholder).includes('留空即保持不变')))
 	check('渲染：环境变量源的只读徽标出现', JSON.stringify(tree).includes('只读'))
+	check('渲染：两个模板各一个「添加」按钮（元宝 / Tavily）', findAll(tree, (el) => el.type === 'button' && String(el.props.children).startsWith('添加：')).length === 2)
 }
 {
 	// 到上限：添加按钮必须置灰
-	const full = { sources: [0, 1, 2].map((n) => ({ id: `s${n}`, kind: 'tavily', mode: 'env', ref: `K${n}`, credential: { configured: false, writable: true }, secret: '', serverMode: 'env' })) }
+	const full = { sources: [0, 1, 2].map((n) => ({ id: `s${n}`, kind: 'tavily', mode: 'env', ref: `K${n}`, credential: { configured: false, writable: true }, secret: '', serverMode: 'env', budgetMonthly: '', budgetReserve: '', promo: null, usage: null, used: '0', serverUsed: 0 })) }
 	face.hooks.webSearchChain.set({ status: 'ready', error: null, state: SERVER_STATE, draft: full, saving: false, notice: null })
 	const tree = expandAll(reg.Comp(propsFor('page')))
 	const buttons = findAll(tree, (el) => el.type === 'button')
@@ -324,7 +406,7 @@ face.hooks.webSearchChain.set({ status: 'ready', error: null, state: SERVER_STAT
 }
 {
 	// 有问题：保存键必须置灰
-	const bad = { sources: [{ id: 's1', kind: 'tavily', mode: 'env', ref: '', credential: {}, secret: '', serverMode: 'env' }] }
+	const bad = { sources: [{ id: 's1', kind: 'tavily', mode: 'env', ref: '', credential: {}, secret: '', serverMode: 'env', budgetMonthly: '', budgetReserve: '', promo: null, usage: null, used: '0', serverUsed: 0 }] }
 	face.hooks.webSearchChain.set({ status: 'ready', error: null, state: SERVER_STATE, draft: bad, saving: false, notice: null })
 	const tree = expandAll(reg.Comp(propsFor('page')))
 	const buttons = findAll(tree, (el) => el.type === 'button')
@@ -352,10 +434,14 @@ face.hooks.webSearchChain.set({ status: 'ready', error: null, state: SERVER_STAT
 face.hooks.webSearchChain.set({ status: 'ready', error: null, state: SERVER_STATE, draft: I.draftFromState(SERVER_STATE), saving: false, notice: null })
 face.edit({ kind: 'mode', index: 0, value: 'literal' })
 check('edit(mode)：草稿真的变了（不是只画了个控件）', face.hooks.webSearchChain.getSnapshot().draft.sources[0].mode === 'literal')
-face.edit({ kind: 'add' })
-check('edit(add)：草稿多了一个源', face.hooks.webSearchChain.getSnapshot().draft.sources.length === 3)
+face.edit({ kind: 'add', value: 'tavily' })
+check('edit(add)：草稿多了一个源（按模板 kind）', face.hooks.webSearchChain.getSnapshot().draft.sources.length === 3)
 face.edit({ kind: 'remove', index: 2 })
 check('edit(remove)：草稿少了一个源', face.hooks.webSearchChain.getSnapshot().draft.sources.length === 2)
+face.edit({ kind: 'secretId', index: 0, value: 'AKIDchanged' })
+check('edit(secretId)：SecretId 可换（草稿立即更新）', face.hooks.webSearchChain.getSnapshot().draft.sources[0].secretId === 'AKIDchanged')
+face.edit({ kind: 'used', index: 0, value: '13' })
+check('edit(used)：校准值进草稿', face.hooks.webSearchChain.getSnapshot().draft.sources[0].used === '13')
 
 const calls = []
 fetchImpl = async (url, init) => {
@@ -365,6 +451,8 @@ fetchImpl = async (url, init) => {
 await face.load()
 await new Promise((resolve) => setTimeout(resolve, 0))
 check('load()：GET 到 /api/web-search-chain.config', calls.some((call) => call.url === '/api/web-search-chain.config' && call.init.method === 'GET'), JSON.stringify(calls.map((c) => [c.url, c.init?.method])))
+// 先改一下校准值再保存：请求体里必须带上 usage（只带改过的那一条）
+face.hooks.webSearchChain.set({ status: 'ready', error: null, state: SERVER_STATE, draft: I.setUsed(I.draftFromState(SERVER_STATE), 0, '20'), saving: false, notice: null })
 await face.save()
 await new Promise((resolve) => setTimeout(resolve, 0))
 {
@@ -374,6 +462,12 @@ await new Promise((resolve) => setTimeout(resolve, 0))
 		const body = JSON.parse(post.init.body)
 		return body.sources.length === 2 && body.sources.every((row) => !('secret' in row))
 	})(), post.init.body)
+	check('save()：yuanbao 源带 secretId 与 budget', (() => {
+		const body = JSON.parse(post.init.body)
+		const row = body.sources.find((source) => source.kind === 'yuanbao')
+		return row?.secretId === 'AKIDtestSecretId0000000000000000' && row?.budget?.monthly === 2000 && row?.budget?.promo?.until === '2026-11-30'
+	})(), post.init.body)
+	check('save()：usage 只带改过的那条（s1: 20）', eq(JSON.parse(post.init.body).usage, { s1: 20 }), post.init.body)
 	check('save() 成功后状态回到 ready 并给出「已保存」提示', (() => {
 		const snapshot = face.hooks.webSearchChain.getSnapshot()
 		return snapshot.status === 'ready' && snapshot.saving === false && snapshot.notice?.tone === 'ok'
