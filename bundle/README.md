@@ -114,13 +114,16 @@ dsh plugin --profile <你的 profile> add dsh-websearch-tavily-keys-select
 | `昨天 …` | `Freshness="d2"` |
 | `本周/最近7天 …` / `最近3天 …` | `Freshness="d7"` / `"d3"` |
 | `本月 …` / `最近3个月 …` / `今年 …` | `Freshness="m1"` / `"m3"` / `"y1"` |
-| `2026年10月21日 …`（显式日期） | 按距今天数折算成 `d2/d7/m1/m3/y1` |
+| `2026年10月21日 …`（显式日期） | 按距今天数折算成 `d2/d7/m1/m3/y1…y5` |
+| `最近2年 …` / `近4年 …` / `去年 …` | `y2` / `y4` / `y1` |
 
+- **官方语法**（照腾讯云「元宝搜索 Skill」v1.0.4 的参数表）：`Freshness` 只接受 `d1–30` / `m1–12` / `y1–5`（另收 `year`）；超出范围**自动夹到上限**（`最近40天` → `d30`），不会把整条查询丢掉。`Site` 要求严格域名格式。
 - **为什么必须这样**：元宝把 `site:` 当普通词（实测 `site:github.com` 完全不生效），而 `Freshness` 是独立参数。
 - **`最新/latest` 不触发**：这类宽泛词会误伤官网资料页（它们没有日期）；实测 `Latest DeepSeek model release` 不传更稳。
 - **实测收益**：问「2026年10月21日 A股 收盘」不传 Freshness 时 10 条全是 **2025 年同日旧闻**；加了 `d2` 后 10/10 是当日新闻。
 - **覆盖**：链行配置里写 `yuanbao.freshness` / `yuanbao.site` 会**强制**用配置值（压过自动判定），适合"只想搜某站"的专用实例。
-- `Site` 只对自然结果生效（`Mode=1` 的垂直卡片不吃它）；实测黑名单语法 `-host` 返回 **0 条**，暂不支持。
+- `Site` 只对自然结果生效（`Mode=1` 的垂直卡片不吃它）；实测黑名单语法 `-host` 返回 **0 条**，官方 skill 文档也**没有**排除语法 ⇒ 不支持。
+- **失败提示**：腾讯云的业务错误会被翻成一句能照做的中文（未授权 → 去控制台确认开通与权限；欠费 → 去费用中心；未开通 → 去开通；限流 → 稍后重试），直接拼在错误消息里给模型看。
 
 ### 配置存在哪 / 怎么排查
 
@@ -143,9 +146,9 @@ dsh plugin --profile <你的 profile> add dsh-websearch-tavily-keys-select
 ### 测试（离线，任意 cwd）
 
 ```powershell
-node test\run-all.mjs         # 9 个测试文件 / 164 条（含 manifest 11、route 35、core-budget 14、tencent-sign 9）
+node test\run-all.mjs         # 9 个测试文件 / 165 条（含 manifest 11、route 35、core-budget 14、tencent-sign 9）
 node test\verify-client.mjs   # 客户端验证台：80/80（含合规守卫、注册 key 动态比对）
-node test\make-mutants.mjs    # 变异测试：14/14 必须被杀（含"拆掉额度闸门""月份键改 UTC""签名不做小写""停用的源照样被搜"）
+node test\make-mutants.mjs    # 变异测试：16/16 必须被杀（含"拆掉额度闸门""月份键改 UTC""签名不做小写""停用的源照样被搜"）
 ```
 
 > ⚠️ 别用 `node --test`：本机沙箱禁命名管道，runner 会 spawn EPERM 并给出误导性的 `# fail 1`。

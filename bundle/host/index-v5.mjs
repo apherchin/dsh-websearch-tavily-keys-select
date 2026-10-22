@@ -252,7 +252,7 @@ export function parseSearchIntent(query, nowMs) {
 		{ pattern: /本周|这周|这个星期|近一周|最近一周|最近\s*7\s*天|近\s*7\s*天|过去一周|this week/i, freshness: 'd7' },
 		{ pattern: /本月|这个月|近一个月|最近一个月|最近\s*30\s*天|过去一个月|this month/i, freshness: 'm1' },
 		{ pattern: /近三个月|最近三个月|最近\s*3\s*个月/i, freshness: 'm3' },
-		{ pattern: /今年|本年度|今年以来|近一年|最近一年|过去一年|this year/i, freshness: 'y1' },
+		{ pattern: /今年|本年度|今年以来|近一年|最近一年|过去一年|去年|this year|last year/i, freshness: 'y1' },
 	]
 	let freshness
 	for (const hint of hints) {
@@ -261,22 +261,29 @@ export function parseSearchIntent(query, nowMs) {
 			break
 		}
 	}
-	// 3) 「最近 N 天 / N 个月」这种带数字的写法
+	// 3) 「最近 N 天 / N 个月 / N 年」这种带数字的写法（官方语法：d1–30 / m1–12 / y1–5，超界夹到上限）
 	if (freshness === undefined) {
-		const days = /最近\s*(\d{1,2})\s*天|近\s*(\d{1,2})\s*天|last\s*(\d{1,2})\s*days?/i.exec(text)
+		const days = /最近\s*(\d{1,3})\s*天|近\s*(\d{1,3})\s*天|last\s*(\d{1,3})\s*days?/i.exec(text)
 		if (days !== null) {
 			const count = Number(days[1] ?? days[2] ?? days[3])
-			if (Number.isInteger(count) && count >= 1 && count <= 30) freshness = `d${count}`
+			if (Number.isInteger(count) && count >= 1) freshness = `d${Math.min(count, 30)}`
 		}
 	}
 	if (freshness === undefined) {
 		const months = /最近\s*(\d{1,2})\s*个月|近\s*(\d{1,2})\s*个月|last\s*(\d{1,2})\s*months?/i.exec(text)
 		if (months !== null) {
 			const count = Number(months[1] ?? months[2] ?? months[3])
-			if (Number.isInteger(count) && count >= 1 && count <= 12) freshness = `m${count}`
+			if (Number.isInteger(count) && count >= 1) freshness = `m${Math.min(count, 12)}`
 		}
 	}
-	// 4) 显式日期：按距今天数折算（`Freshness` 只有相对窗口，没有绝对区间）
+	if (freshness === undefined) {
+		const years = /最近\s*(\d{1,2})\s*年|近\s*(\d{1,2})\s*年|last\s*(\d{1,2})\s*years?/i.exec(text)
+		if (years !== null) {
+			const count = Number(years[1] ?? years[2] ?? years[3])
+			if (Number.isInteger(count) && count >= 1) freshness = `y${Math.min(count, 5)}`
+		}
+	}
+	// 4) 显式日期：按距今天数折算（`Freshness` 只有相对窗口，没有绝对区间；上限 y5 ≈ 5 年）
 	if (freshness === undefined) {
 		const explicit = /(20\d{2})\s*[年\-/.]\s*(\d{1,2})\s*[月\-/.]\s*(\d{1,2})/u.exec(text)
 		if (explicit !== null) {
@@ -288,7 +295,11 @@ export function parseSearchIntent(query, nowMs) {
 					else if (daysAgo <= 7) freshness = 'd7'
 					else if (daysAgo <= 31) freshness = 'm1'
 					else if (daysAgo <= 92) freshness = 'm3'
-					else if (daysAgo <= 366) freshness = 'y1'
+					else {
+						// 一年以内 y1，之后按 366 天/年夹到 y2…y5（超过 5 年不设时效，交给相关性排序）
+						const yearsAgo = Math.ceil(daysAgo / 366)
+						if (yearsAgo <= 5) freshness = `y${Math.min(yearsAgo, 5)}`
+					}
 				}
 			}
 		}
@@ -475,7 +486,34 @@ function yuanbaoError(error) {
 				? 'WEB_PROVIDER_UNAVAILABLE'
 				: 'WEB_PROVIDER_ERROR'
 	const permanent = code.startsWith('AuthFailure') || code === 'ResourceNotFound' || code === 'ResourceUnavailable'
-	return new ChainError(`Yuanbao search failed (${code})${message.length > 0 ? `: ${message}` : ''}`, mapped, { permanent })
+	const hint = yuanbaoErrorHint(code, message)
+	const suffix = hint === undefined ? '' : `（${hint}）`
+	return new ChainError(`Yuanbao search failed (${code})${message.length > 0 ? `: ${message}` : ''}${suffix}`, mapped, { permanent })
+}
+
+/**
+ * 把腾讯云的业务错误翻成**能直接照做**的一句中中文提示。
+ *
+ * 依据官方「元宝搜索 Skill」的错误处理章节，线上其实只有三类：**未授权 / 服务未开通 / 服务不可用（欠费）**。
+ * 模型看到的是 `ChainError.message`，所以把提示拼在 message 里最省事——不用界面也能读到。
+ * @param code - `Response.Error.Code`。
+ * @param message - `Response.Error.Message`。
+ * @returns 中文提示，或 undefined（无需提示）。
+ */
+export function yuanbaoErrorHint(code, message) {
+	const text = `${code} ${message}`
+	if (/^(AuthFailure|UnauthorizedOperation)/u.test(code) || text.includes('未授权') || text.includes('Unauthorized')) {
+		return '请到元宝搜索控制台确认服务已开通，并检查 SecretId/SecretKey 的权限；账号欠费请先到费用中心补缴'
+	}
+	if (code.includes('InArrears') || text.includes('欠费') || text.includes('arrears')) {
+		return '账号欠费已导致服务停用，请到腾讯云费用中心补缴后再试'
+	}
+	if (code === 'FailedOperation.ServiceNotOpened' || text.includes('未开通') || text.includes('not activated')) {
+		return '元宝搜索服务尚未开通，请到控制台开通服务（https://console.cloud.tencent.com/wsapi）'
+	}
+	if (code === 'RequestLimitExceeded') return '触发限流，稍后重试或降低并发'
+	if (code === 'ResourceUnavailable') return '服务暂不可用，通常是欠费或未开通，请到控制台确认'
+	return undefined
 }
 
 /** 读 Tavily 的 `{detail:{error}}` 失败体，绝不因为读失败体而失败。 */

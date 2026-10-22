@@ -125,6 +125,20 @@ const MUTANTS = [
 		replace: 'const freshness = settings.freshness',
 		test: 'test/chain-provider.test.mjs',
 	},
+	{
+		name: 'M15 未授权/签名错误不再给中文提示（模型只能看到云厂商原文）',
+		file: 'bundle/host/index-v5.mjs',
+		find: "if (/^(AuthFailure|UnauthorizedOperation)/u.test(code)",
+		replace: 'if (false && /^(AuthFailure|UnauthorizedOperation)/u.test(code)',
+		test: 'test/chain-provider.test.mjs',
+	},
+	{
+		name: 'M16 Freshness 超界不夹到官方上限（发 d40 给上游必被拒）',
+		file: 'bundle/host/index-v5.mjs',
+		find: 'freshness = `d${Math.min(count, 30)}`',
+		replace: 'freshness = `d${count}`',
+		test: 'test/chain-provider.test.mjs',
+	},
 ]
 
 /** 复制正本（跳过 .tmp），返回副本根目录。 */

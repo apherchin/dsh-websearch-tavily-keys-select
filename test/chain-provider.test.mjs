@@ -220,7 +220,7 @@ const { usagePath, runtimePath } = await import('../bundle/host/index-v5.mjs')
 const { writeRuntimeState, readRuntimeState, readConfigDocument } = await import('../bundle/host/config-store.mjs')
 const { writeUsageDocument } = await import('../bundle/host/config-store.mjs')
 const { beijingMonthKey } = await import('../bundle/host/core.mjs')
-const { mapYuanbaoPages, mapTavilySources, mapDeepseekApiSources, sanitizeUrl, parseSearchIntent } = await import('../bundle/host/index-v5.mjs')
+const { mapYuanbaoPages, mapTavilySources, mapDeepseekApiSources, sanitizeUrl, parseSearchIntent, yuanbaoErrorHint } = await import('../bundle/host/index-v5.mjs')
 
 const SECRET_KEY_REF = 'TENCENTCLOUD_SECRET_KEY'
 const SECRET_ID = 'AKIDtestSecretId0000000000000000'
@@ -420,13 +420,31 @@ await test('parseSearchIntent：时间词 → Freshness 窗口（含最近 N 天
 		['2026年10月21日 A股 收盘', 'd2'], // 距今 1 天
 		['2026-10-18 的新闻', 'd7'], // 距今 4 天
 		['2026年8月1日 的公告', 'm3'], // 距今 82 天
+		// 官方 skill 的语法表：d1–30 / m1–12 / y1–5（另有 year=最近一年）
+		['最近2年 的 融资', 'y2'],
+		['近 4 年 的 政策', 'y4'],
+		['去年 的 财报', 'y1'],
+		['2023年6月1日 的公告', 'y4'], // 距 2026-10-22 约 3.4 年 ⇒ 按 366 天/年折算成 y4
 	]
 	for (const [query, expected] of cases) {
 		assert.equal(parseSearchIntent(query, base).freshness, expected, query)
 	}
+	// 超界**夹到官方上限**（d30 / m12 / y5），而不是整条丢掉
+	assert.equal(parseSearchIntent('最近 40 天 的 新闻', base).freshness, 'd30')
+	assert.equal(parseSearchIntent('最近 20 个月 的 数据', base).freshness, 'm12')
+	assert.equal(parseSearchIntent('最近 9 年 的 资料', base).freshness, 'y5')
 	// "最新/latest" 这类宽泛词**不**触发（会误伤官网资料页）
 	assert.equal(parseSearchIntent('Latest DeepSeek model release', base).freshness, undefined)
 	assert.equal(parseSearchIntent('最新版本 说明', base).freshness, undefined)
+})
+
+await test('yuanbaoErrorHint：未授权 / 欠费 / 未开通 / 限流 各给一句能照做的中文提示', () => {
+	assert.match(yuanbaoErrorHint('UnauthorizedOperation', '未授权操作。'), /控制台.*开通/u)
+	assert.match(yuanbaoErrorHint('AuthFailure.SignatureFailure', '签名错误'), /SecretId\/SecretKey/u)
+	assert.match(yuanbaoErrorHint('ResourceUnavailable.InArrears', '账号已欠费'), /费用中心/u)
+	assert.match(yuanbaoErrorHint('FailedOperation.ServiceNotOpened', ''), /尚未开通/u)
+	assert.match(yuanbaoErrorHint('RequestLimitExceeded', ''), /限流/u)
+	assert.equal(yuanbaoErrorHint('SomeUnknown.Code', 'whatever'), undefined)
 })
 
 await test('★元宝腿：query 里的意图真的进到了请求体（Site / Freshness），审计也记下来', async () => {
