@@ -421,6 +421,28 @@ face.hooks.webSearchChain.set({ status: 'ready', error: null, state: SERVER_STAT
 	check('渲染：自动停用的源显示原因 + 「恢复」按钮', text.includes('已自动停用') && text.includes('HTTP 432') && text.includes('恢复'))
 }
 {
+	// 上游额度（Tavily 专属）：按钮 + 结果行 + credits 文案
+	const tavilyState = {
+		...SERVER_STATE,
+		sources: [
+			{
+				...SERVER_STATE.sources[1],
+				usage: { month: '2026-10', unit: 'credits', calls: 3, credits: 5, unlimited: false, monthly: 1000, reserve: 100, used: 5, remaining: 895, exhausted: false, promo: null },
+			},
+		],
+	}
+	const withUpstream = I.draftFromState(tavilyState)
+	const patched = { sources: [{ ...withUpstream.sources[0], upstream: { ok: true, plan: 'Researcher', planUsage: 1000, planLimit: 1000 } }] }
+	face.hooks.webSearchChain.set({ status: 'ready', error: null, state: tavilyState, draft: patched, saving: false, notice: null })
+	const rendered = JSON.stringify(expandAll(reg.Comp(propsFor('page'))))
+	check('渲染：Tavily 行有「查额度」按钮', rendered.includes('查额度'))
+	check('渲染：上游结果行显示套餐与用量，并在用满时标注', rendered.includes('上游') && rendered.includes('Researcher') && rendered.includes('已用满'))
+	check('渲染：Tavily 的用量文案用 credits（不写「次」）', rendered.includes('credits'))
+	const failed = { sources: [{ ...withUpstream.sources[0], upstream: { ok: false, error: 'HTTP 401' } }] }
+	face.hooks.webSearchChain.set({ status: 'ready', error: null, state: tavilyState, draft: failed, saving: false, notice: null })
+	check('渲染：查额度失败显示原因（不外抛）', JSON.stringify(expandAll(reg.Comp(propsFor('page')))).includes('查额度失败'))
+}
+{
 	// 纯逻辑：勾选/恢复 + 请求体
 	const draft = I.draftFromState(SERVER_STATE)
 	const off = I.toggleDisabled(draft, 0, false)

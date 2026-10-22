@@ -86,6 +86,12 @@ window.__ModuleLoader__.load({
 				usedCalibrate: "（可改，用于和腾讯云控制台对账）",
 				badUsed: "「本月已用」必须是非负整数。",
 				usageUnlimited: (used) => `本月已用 ${used} 次（未设上限）`,
+				usageLineCredits: (used, monthly, remaining) => `本月已用 ${used} / ${monthly} credits · 还剩 ${remaining}`,
+				usageUnlimitedCredits: (used) => `本月已用 ${used} credits（未设上限）`,
+				queryUsage: "查额度",
+				upstreamLine: (plan, used, limit) => `上游：${plan ?? "—"} ${used ?? "?"}/${limit ?? "?"} credits`,
+				upstreamFull: "已用满",
+				upstreamFailed: (reason) => `查额度失败：${reason}`,
 				usageLine: (used, monthly, remaining) => `本月已用 ${used} / ${monthly} 次 · 还剩 ${remaining}`,
 				usageReserve: (reserve) => ` · 其中 ${reserve} 次作为余量不使用`,
 				usagePromo: (monthly, until) => ` · 活动额度 ${monthly} 次（至 ${until}，到期自动降回日常额度）`,
@@ -142,6 +148,12 @@ window.__ModuleLoader__.load({
 				usedCalibrate: "(editable, for reconciling with the Tencent Cloud console)",
 				badUsed: "“Used this month” must be a non-negative integer.",
 				usageUnlimited: (used) => `${used} calls used this month (no cap)`,
+				usageLineCredits: (used, monthly, remaining) => `${used} / ${monthly} credits used this month · ${remaining} left`,
+				usageUnlimitedCredits: (used) => `${used} credits used this month (no cap)`,
+				queryUsage: "Check quota",
+				upstreamLine: (plan, used, limit) => `Upstream: ${plan ?? "—"} ${used ?? "?"}/${limit ?? "?"} credits`,
+				upstreamFull: "exhausted",
+				upstreamFailed: (reason) => `Quota check failed: ${reason}`,
 				usageLine: (used, monthly, remaining) => `${used} / ${monthly} calls used this month · ${remaining} left`,
 				usageReserve: (reserve) => ` · ${reserve} calls held back as a reserve`,
 				usagePromo: (monthly, until) => ` · promotion quota ${monthly} calls (until ${until}, then back to the regular quota)`,
@@ -243,6 +255,8 @@ window.__ModuleLoader__.load({
 					disabled: source.disabled === true,
 					autoDisabled: source.autoDisabled ?? null,
 					restoreAuto: false,
+					// 上游额度查询结果（草稿态，不提交）：`{ok, plan, planUsage, planLimit, error}` 或 null
+					upstream: null,
 				};
 			});
 			return { sources };
@@ -334,6 +348,7 @@ window.__ModuleLoader__.load({
 						disabled: false,
 						autoDisabled: null,
 						restoreAuto: false,
+						upstream: null,
 					},
 				],
 			};
@@ -452,8 +467,12 @@ window.__ModuleLoader__.load({
 		function usageText(usage) {
 			if (usage === null || usage === undefined) return "";
 			const used = Number.isInteger(usage.used) ? usage.used : 0;
-			if (usage.unlimited === true || usage.monthly === null) return copy.usageUnlimited(used);
-			const parts = [copy.usageLine(used, usage.monthly, usage.remaining ?? 0)];
+			// Tavily 按 credit 计量（basic 1 / advanced 2），文案不能写「次」，否则数字对不上官方后台
+			const line = usage.unit === "credits" ? copy.usageLineCredits : copy.usageLine;
+			if (usage.unlimited === true || usage.monthly === null) {
+				return usage.unit === "credits" ? copy.usageUnlimitedCredits(used) : copy.usageUnlimited(used);
+			}
+			const parts = [line(used, usage.monthly, usage.remaining ?? 0)];
 			if (Number.isInteger(usage.reserve) && usage.reserve > 0) parts.push(copy.usageReserve(usage.reserve));
 			if (usage.promo !== null && usage.promo !== undefined && usage.promo.active === true) {
 				parts.push(copy.usagePromo(usage.promo.monthly, usage.promo.until));
@@ -667,6 +686,42 @@ window.__ModuleLoader__.load({
 				jsx("p", { style: S.hint, children: usageText(source.usage) }, `usage-${index}`),
 			];
 		}
+		/**
+		 * Tavily 专属：上游额度行 + 「查额度」按钮。
+		 *
+		 * 这是腾讯云做不到的一件事：Tavily 有 `GET /usage`，能直接读到套餐已用/上限，
+		 * 与本地账本（credits）可以互相印证。
+		 */
+		function renderUpstreamExtras(source, index, props) {
+			if (source.kind !== "tavily") return [];
+			const upstream = source.upstream ?? null;
+			let line = null;
+			if (upstream !== null && upstream.loading === true) {
+				line = jsx("span", { style: S.hint, children: copy.loading }, `upstream-${index}`);
+			} else if (upstream !== null && upstream.ok === true) {
+				const full = Number.isInteger(upstream.planUsage) && Number.isInteger(upstream.planLimit) && upstream.planUsage >= upstream.planLimit;
+				line = jsx(
+					"span",
+					{ children: `${copy.upstreamLine(upstream.plan, upstream.planUsage, upstream.planLimit)}${full ? ` · ${copy.upstreamFull}` : ""}` },
+					`upstream-${index}`,
+				);
+			} else if (upstream !== null) {
+				line = jsx("span", { style: S.hint, children: copy.upstreamFailed(upstream.error ?? "unknown") }, `upstream-${index}`);
+			}
+			return [
+				jsxs(
+					"div",
+					{
+						style: S.field,
+						children: [
+							jsx(AtomButton, { children: copy.queryUsage, onClick: () => props.queryUsage(index) }),
+							line,
+						],
+					},
+					`query-usage-${index}`,
+				),
+			];
+		}
 		/** 一个源的渲染：模板 + 两个互斥 checkbox + 对应输入框 + 删除。 */
 		function renderSourceRow(source, index, templates, props) {
 			const kind = source.kind;
@@ -712,6 +767,7 @@ window.__ModuleLoader__.load({
 								)
 							: null,
 						...(kind === "yuanbao" ? renderYuanbaoExtras(source, index, props) : []),
+						...renderUpstreamExtras(source, index, props),
 						jsx(AtomCheckbox, {
 							checked: isEnv,
 							label: copy.modeEnv,
@@ -868,6 +924,36 @@ window.__ModuleLoader__.load({
 				});
 			}
 		}
+		/**
+		 * 查某个源在**上游**的真实用量（目前只有 Tavily 有 `/usage`；腾讯云没有这个接口）。
+		 *
+		 * 只读动作：不动配置、不需要保存；结果放草稿的 `upstream`（不提交）。
+		 * 任意失败都落成 `{ok:false, error}` 显示在行内，绝不外抛。
+		 */
+		async function loadUpstreamUsage(store, index) {
+			const snapshot = store.getSnapshot();
+			const source = snapshot?.draft?.sources?.[index];
+			if (source === undefined || typeof source.id !== "string" || source.id.length === 0) return;
+			store.update((shell) => {
+				shell.draft = patchSource(shell.draft, index, { upstream: { loading: true } });
+			});
+			let result;
+			try {
+				const response = await fetch(CONFIG_PATH, {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ queryUsage: [source.id] }),
+				});
+				const payload = await response.json().catch(() => void 0);
+				const one = payload?.results?.[source.id];
+				result = one ?? { ok: false, error: `HTTP ${response.status}` };
+			} catch (error) {
+				result = { ok: false, error: String(error) };
+			}
+			store.update((shell) => {
+				shell.draft = patchSource(shell.draft, index, { upstream: result });
+			});
+		}
 		/** 保存草稿。失败就地显示服务端的话，草稿保留。 */
 		async function saveDraft(store) {
 			const snapshot = store.getSnapshot();
@@ -942,6 +1028,9 @@ window.__ModuleLoader__.load({
 										edit: (action) => {
 											applyEdit(store, action);
 										},
+										queryUsage: (index) => {
+											loadUpstreamUsage(store, index).catch((error) => console.error("[web-search-chain] 查额度失败（已忽略）：", error));
+										},
 									}),
 								},
 								WebSearchChainCard,
@@ -987,10 +1076,11 @@ window.__ModuleLoader__.load({
 			credentialText,
 			usageText,
 			recycledRefs,
-			summaryText,
-			applyEdit,
+			summaryText,			applyEdit,
 			loadState,
 			saveDraft,
+			loadUpstreamUsage,
+			renderUpstreamExtras,
 		};
 		return module.exports;
 	},

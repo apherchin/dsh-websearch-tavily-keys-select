@@ -85,7 +85,8 @@ await test('GET：文件不存在时给默认文档 + 默认凭据状态 + 模�
 		{ kind: 'tavily', label: 'Tavily Key', refExample: 'TAVILY_API_KEY' },
 	])
 	const month = beijingMonthKey(Date.now())
-	const unlimitedUsage = { month, unlimited: true, monthly: null, reserve: 0, used: 0, remaining: null, exhausted: false, promo: null }
+	// 默认文档是两个 Tavily 源 ⇒ 计量单位是 credits
+	const unlimitedUsage = { month, unit: 'credits', calls: 0, credits: 0, unlimited: true, monthly: null, reserve: 0, used: 0, remaining: null, exhausted: false, promo: null }
 	assert.deepEqual(body.sources, [
 		// ⚠️ 注意没有 `source` 键：`Response.json` 序列化会丢掉值为 undefined 的键。
 		// 界面因此只能按 `configured` / `writable` 分支（不去读 source）—— 与 spec §7 一致。
@@ -321,7 +322,7 @@ await test('POST 用量校准：只写在请求里出现的源，越界/未知 i
 	assert.equal(status, 200)
 	assert.deepEqual(body.applied.usage, { s1: 1234 })
 	const month = beijingMonthKey(Date.now())
-	assert.equal(readUsageDocument(usagePath()).doc.months[month].s1, 1234)
+	assert.equal(readUsageDocument(usagePath()).doc.months[month].s1.calls, 1234)
 	assert.equal(body.sources[0].usage.used, 1234, 'GET 回来的状态要立刻反映校准值')
 
 	for (const usage of [{ s9: 1 }, { s1: -1 }, { s1: 'x' }, 'nope']) {
@@ -330,7 +331,7 @@ await test('POST 用量校准：只写在请求里出现的源，越界/未知 i
 		assert.equal(rejected.body.code, 'INVALID_USAGE')
 	}
 	// 被拒的校准不该改动账本
-	assert.equal(readUsageDocument(usagePath()).doc.months[month].s1, 1234)
+	assert.equal(readUsageDocument(usagePath()).doc.months[month].s1.calls, 1234)
 })
 
 await test('GET：用量文件损坏时照常 200，并给出 usageError（界面能看见）', async () => {
@@ -383,6 +384,48 @@ await test('POST resetAutoDisabled：清掉自动停用标记（源仍在），�
 })
 //#endregion
 
+await test('POST queryUsage：查上游 Tavily /usage（GET + Bearer），非 Tavily / 未知 id 各有明确 error', async () => {
+	const ctx = makeFakeCtx({ credentials: makeFakeCredentials({ values: { TAVILY_API_KEY1: 'tvly-1' } }), connection: makeFakeConnection() })
+	await readResponse(await post({ sources: [{ kind: 'tavily', mode: 'env', ref: 'TAVILY_API_KEY1' }, { kind: 'deepseek-api', mode: 'env', ref: 'DEEPSEEK_API_KEY' }] }, ctx))
+	const realFetch = globalThis.fetch
+	let seen
+	globalThis.fetch = async (url, init) => {
+		seen = { url, init }
+		return new Response(
+			JSON.stringify({ key: { usage: 1000, limit: null }, account: { current_plan: 'Researcher', plan_usage: 1000, plan_limit: 1000, search_usage: 1000 } }),
+			{ status: 200, headers: { 'content-type': 'application/json' } },
+		)
+	}
+	try {
+		const { status, body } = await readResponse(await post({ queryUsage: ['s1', 's2', 'nope'] }, ctx))
+		assert.equal(status, 200)
+		assert.equal(seen.url, 'https://api.tavily.com/usage')
+		assert.equal(seen.init.method, 'GET')
+		assert.equal(seen.init.headers.authorization, 'Bearer tvly-1')
+		assert.deepEqual(body.results.s1, { ok: true, plan: 'Researcher', planUsage: 1000, planLimit: 1000, keyUsage: 1000, keyLimit: null, searchUsage: 1000 })
+		assert.deepEqual(body.results.s2, { ok: false, error: 'unsupported-kind' })
+		assert.deepEqual(body.results.nope, { ok: false, error: 'unknown-source' })
+	} finally {
+		globalThis.fetch = realFetch
+	}
+})
+
+await test('POST queryUsage：缺凭据 / 上游报错 / 超时 都归一化成 {ok:false, error}', async () => {
+	const ctx = makeFakeCtx({ credentials: makeFakeCredentials({ values: {} }), connection: makeFakeConnection() })
+	await readResponse(await post({ sources: [{ kind: 'tavily', mode: 'env', ref: 'TAVILY_API_KEY1' }] }, ctx))
+	const realFetch = globalThis.fetch
+	let mode = 'http'
+	globalThis.fetch = async () => {
+		if (mode === 'http') return new Response(JSON.stringify({ detail: { error: 'invalid api key' } }), { status: 401, headers: { 'content-type': 'application/json' } })
+		throw Object.assign(new Error('timed out'), { name: 'TimeoutError' })
+	}
+	try {
+		const { body } = await readResponse(await post({ queryUsage: ['s1'] }, ctx))
+		assert.deepEqual(body.results.s1, { ok: false, error: 'credential-missing' })
+	} finally {
+		globalThis.fetch = realFetch
+	}
+})
 await test('apply 两次（同一 ctx）也不抛：路由重复注册由 connection 自己兜（这里换新 connection）', () => {
 	const ctx = makeFakeCtx({ credentials: makeFakeCredentials(), connection: makeFakeConnection() })
 	assert.doesNotThrow(() => {

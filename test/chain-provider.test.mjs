@@ -20,8 +20,8 @@ const realFetch = globalThis.fetch
 function stubFetch(handler) {
 	globalThis.fetch = handler
 }
-function tavilyOk(urls) {
-	return new Response(JSON.stringify({ results: urls.map((url) => ({ url, title: url, content: 'x' })), usage: { credits: 1 } }), {
+function tavilyOk(urls, credits = 1) {
+	return new Response(JSON.stringify({ results: urls.map((url) => ({ url, title: url, content: 'x' })), usage: { credits } }), {
 		status: 200,
 		headers: { 'content-type': 'application/json' },
 	})
@@ -101,6 +101,7 @@ await test('一条源请求失败 ⇒ 推进到下一条（HTTP 401 带出 detai
 		stubFetch(realFetch)
 	}
 })
+
 
 await test('全败 ⇒ 抛 WEB_PROVIDER_ERROR，文案逐条列出每个源', async () => {
 	const { provider } = mountChain({ credentials: makeFakeCredentials({ values: { K1: 'k1' } }) })
@@ -284,7 +285,9 @@ await test('yuanbao 腿：一次成功调用会记进本月用量（北京时间
 		const month = beijingMonthKey(Date.now())
 		const { readUsageDocument } = await import('../bundle/host/config-store.mjs')
 		const usage = readUsageDocument(usagePath())
-		assert.equal(usage.doc.months[month].s1, 1, JSON.stringify(usage.doc))
+		assert.equal(usage.doc.months[month].s1.calls, 1, JSON.stringify(usage.doc))
+	assert.equal(usage.doc.months[month].s1.credits ?? 0, 0, '元宝按次计费，不记 credit')
+	assert.equal(usage.doc.version, 2)
 	} finally {
 		stubFetch(realFetch)
 	}
@@ -467,6 +470,30 @@ await test('deepseek-api 腿：HTTP 429 ⇒ RATE_LIMIT，带出 error.message；
 })
 //#endregion
 
+await test('★Tavily 按 credit 记额度：预算 2 ⇒ advanced 一次（credits=2）就把闸门顶满，第二次不再发请求', async () => {
+	const { provider } = mountChain({ credentials: makeFakeCredentials({ values: { K1: 'k1' } }) })
+	resetUsage()
+	setDoc([{ id: 's1', kind: 'tavily', mode: 'env', ref: 'K1', budget: { monthly: 2, reserve: 0 } }])
+	let calls = 0
+	stubFetch(async () => {
+		calls += 1
+		return tavilyOk(['https://a'], 2)
+	})
+	try {
+		const first = await provider.search({ query: 'q' }, undefined)
+		assert.deepEqual(first.sources.map((source) => source.url), ['https://a'])
+		assert.equal(calls, 1)
+		const month = beijingMonthKey(Date.now())
+		const { readUsageDocument } = await import('../bundle/host/config-store.mjs')
+		const usage = readUsageDocument(usagePath())
+		assert.equal(usage.doc.months[month].s1.credits, 2, JSON.stringify(usage.doc))
+		assert.equal(usage.doc.months[month].s1.calls, 1)
+		await assert.rejects(() => provider.search({ query: 'q' }, undefined), /quota|exhausted|failed/i)
+		assert.equal(calls, 1, '到点后不再发 Tavily 请求（credit 是钱）')
+	} finally {
+		stubFetch(realFetch)
+	}
+})
 //#region 停用：手动（配置里）与自动（运行时状态）——都是 disable，不是 delete
 await test('手动停用（disabled）的源被跳过：不解析凭据、不发请求，但源还在配置里', async () => {
 	const credentials = makeFakeCredentials({ values: { K1: 'k1', K2: 'k2' } })

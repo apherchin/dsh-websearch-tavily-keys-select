@@ -76,7 +76,7 @@ await test('用量路径 = <home>\\web-search-chain-usage.json', () => {
 
 await test('用量文件不存在 ⇒ 空文档、无 error（不主动落盘）', () => {
 	const result = readUsageDocument(usagePath)
-	assert.deepEqual(result.doc, { version: 1, months: {} })
+	assert.deepEqual(result.doc, { version: 2, months: {} })
 	assert.equal(result.error, undefined)
 	assert.equal(existsSync(usagePath), false)
 })
@@ -84,7 +84,7 @@ await test('用量文件不存在 ⇒ 空文档、无 error（不主动落盘）
 await test('用量文件损坏 ⇒ 空文档 + error（绝不抛：坏账本不能把搜索弄挂）', () => {
 	writeFileSync(usagePath, '{oops', 'utf8')
 	const result = readUsageDocument(usagePath)
-	assert.deepEqual(result.doc, { version: 1, months: {} })
+	assert.deepEqual(result.doc, { version: 2, months: {} })
 	assert.ok(result.error.includes('损坏'), result.error)
 })
 
@@ -92,7 +92,8 @@ await test('用量读写往返 + 原子写（不留 .tmp）', () => {
 	writeUsageDocument(usagePath, { months: { '2026-10': { s3: 12 } } })
 	const result = readUsageDocument(usagePath)
 	assert.equal(result.error, undefined)
-	assert.equal(result.doc.months['2026-10'].s3, 12)
+	assert.equal(result.doc.months['2026-10'].s3.calls, 12)
+	assert.equal(result.doc.version, 2)
 	assert.equal(existsSync(`${usagePath}.tmp`), false)
 })
 //#endregion

@@ -42,8 +42,10 @@ import {
 	selectableSources,
 	unusedRefs,
 	usageCount,
+	usageCredits,
 	validateSubmission,
 	withUsageCount,
+	withUsageCredits,
 } from './core.mjs'
 import {
 	configDocumentPath,
@@ -107,6 +109,8 @@ const enabledFallback = new Map()
  * 因此取 `max(文件, 缓存)` 作为事实，并且在写失败时**仍然**推进缓存。
  */
 const usageCache = new Map()
+/** 进程内的 **credit** 缓存（Tavily 按 credit 计量）；与 usageCache 同理取 max(文件, 缓存)。 */
+const creditCache = new Map()
 
 /** 尽最大努力写一条 warn：日志本身绝不许打穿调用方。 */
 function warn(ctx, message) {
@@ -446,6 +450,20 @@ export class ChainSearchProvider {
 	}
 
 	/**
+	 * 本月某源已用 **credit**（Tavily 的计量单位）：同样取 `max(文件, 进程缓存)`。
+	 * 元宝 / DS 搜索 API 按次计费，它们的 credits 恒为 0，闸门走 `usedThisMonth`。
+	 */
+	creditsThisMonth(sourceId, month) {
+		let fromFile = 0
+		try {
+			fromFile = usageCredits(this.readUsage().doc, month, sourceId)
+		} catch {
+			fromFile = 0
+		}
+		return Math.max(fromFile, creditCache.get(`${month}:${sourceId}`) ?? 0)
+	}
+
+	/**
 	 * 记一次调用（**在发请求之前** +1）：失败也算、超时也算。
 	 * 保守方向是对的——超额调用的单价是 DS 搜索的 4 倍，多算一次比少算一次便宜得多。
 	 * @returns 递增后的本月已用次数。
@@ -458,6 +476,27 @@ export class ChainSearchProvider {
 			this.writeUsage(withUsageCount(doc, month, sourceId, next))
 		} catch {
 			// 写盘失败不影响搜索；缓存已经把闸门推进了
+		}
+		return next
+	}
+
+	/**
+	 * 记账一次成功请求消耗的 **credit**（Tavily 的 `usage.credits`；没返回就按 1 记）。
+	 *
+	 * 放在**成功之后**：Tavily 只对成功的搜索计费，失败（432/401/超时）不扣 credit——
+	 * 这与元宝"先记后发"的方向相反，因为两边计费口径不同（元宝按请求、Tavily 按 credit）。
+	 *
+	 * @returns 累计后的本月 credit 数。
+	 */
+	addCredits(sourceId, month, credits) {
+		const amount = Number.isInteger(credits) && credits > 0 ? credits : 1
+		const next = this.creditsThisMonth(sourceId, month) + amount
+		creditCache.set(`${month}:${sourceId}`, next)
+		try {
+			const { doc } = this.readUsage()
+			this.writeUsage(withUsageCredits(doc, month, sourceId, next))
+		} catch {
+			// 同上：缓存已经推进
 		}
 		return next
 	}
@@ -551,6 +590,7 @@ export class ChainSearchProvider {
 						ref: leg.ref,
 						query: request.query,
 						budget: status,
+						unit: 'calls',
 						priorAttempts: attempts,
 					})
 					attempts.push({
@@ -590,12 +630,37 @@ export class ChainSearchProvider {
 
 			// deepseek-api 与 tavily 都是「一把 key + 一个 REST 端点」，共用同一个失败推进形状
 			const target = leg.kind === 'deepseek-api' ? 'deepseek-api' : 'tavily'
+			// Tavily 按 **credit** 计量（basic 1 / advanced 2），其余按**调用次数**
+			const unit = target === 'tavily' ? 'credits' : 'calls'
+			const usedInUnit = unit === 'credits' ? this.creditsThisMonth(leg.id, month) : this.usedThisMonth(leg.id, month)
+			const status = budgetStatus(source, usedInUnit, this.now())
+			if (status.exhausted) {
+				this.record(config, {
+					outcome: 'quota-exhausted',
+					target,
+					slot: leg.id,
+					ref: leg.ref,
+					query: request.query,
+					budget: status,
+					unit,
+					priorAttempts: attempts,
+				})
+				attempts.push({
+					id: leg.id,
+					ref: leg.ref,
+					outcome: 'quota-exhausted',
+					message: `${status.used}/${status.monthly} ${unit} used this month (reserve ${status.reserve})`,
+				})
+				continue
+			}
+			const calls = this.bumpUsage(leg.id, month)
 			try {
 				const result =
 					leg.kind === 'deepseek-api'
 						? await this.searchDeepseekApi(config, apiKey, request, signal)
 						: await this.searchTavily(config, apiKey, request, signal)
 				this.noteSuccess(leg.id)
+				const credits = result.credits === undefined ? undefined : this.addCredits(leg.id, month, result.credits)
 				this.record(config, {
 					outcome: 'served',
 					target,
@@ -603,7 +668,9 @@ export class ChainSearchProvider {
 					ref: leg.ref,
 					query: request.query,
 					sources: result.sources.length,
-					...(result.credits === undefined ? {} : { credits: result.credits }),
+					calls,
+					...(credits === undefined ? {} : { credits }),
+					...(status.monthly === null ? {} : { budget: { monthly: status.monthly, reserve: status.reserve, unit } }),
 					priorAttempts: attempts,
 				})
 				return { sources: result.sources, truncated: false }
@@ -839,19 +906,7 @@ export class ChainSearchProvider {
 	 * 再退回本进程环境。取不到就是 `undefined`，让链路推进；格式不对的引用同样跳过。
 	 */
 	async resolveCredential(reference) {
-		if (!REF_PATTERN.test(reference)) return undefined
-		const credentials = this.ctx.get('credentials')
-		if (credentials !== undefined) {
-			try {
-				const resolved = await credentials.resolve(reference)
-				const value = resolved?.value
-				if (typeof value === 'string' && value.length > 0) return value.trim()
-			} catch {
-				// 落到进程环境
-			}
-		}
-		const ambient = process.env[reference]
-		return typeof ambient === 'string' && ambient.length > 0 ? ambient.trim() : undefined
+		return resolveCredentialValue(this.ctx, reference)
 	}
 
 	/** 记一行审计。审计绝不许弄坏一次搜索。 */
@@ -974,6 +1029,7 @@ export { MAX_SOURCES, TEMPLATES, defaultDocument, warn }
 export function __resetFallbackRegistryForTests() {
 	enabledFallback.clear()
 	usageCache.clear()
+	creditCache.clear()
 }
 
 //#region 配置路由：GET 读状态 / POST 保存（全有全无）
@@ -1026,13 +1082,16 @@ export async function readState(ctx) {
 	const sources = []
 	for (const source of doc.sources) {
 		const budget = effectiveBudget(source) ?? null
-		// 与额度闸门同口径：取 max(文件, 进程缓存)，否则写盘失败时界面会少报已用次数
-		const used = Math.max(usageCount(usage.doc, month, source.id), usageCache.get(`${month}:${source.id}`) ?? 0)
+		// Tavily 按 credit 计量；其余按调用次数（与闸门同口径）
+		const unit = source.kind === 'tavily' ? 'credits' : 'calls'
+		const calls = Math.max(usageCount(usage.doc, month, source.id), usageCache.get(`${month}:${source.id}`) ?? 0)
+		const credits = Math.max(usageCredits(usage.doc, month, source.id), creditCache.get(`${month}:${source.id}`) ?? 0)
+		const used = unit === 'credits' ? credits : calls
 		sources.push({
 			...source,
 			budget,
 			credential: await describeCredential(ctx, source.ref),
-			usage: { month, ...budgetStatus(source, used, Date.now()) },
+			usage: { month, unit, calls, credits, ...budgetStatus(source, used, Date.now()) },
 			disabled: source.disabled === true,
 			autoDisabled: autoDisabledOf(runtime.state, source.id) ?? null,
 		})
@@ -1050,6 +1109,96 @@ export async function readState(ctx) {
 		usageError: usage.error ?? null,
 		stateError: runtime.error ?? null,
 	}
+}
+
+/**
+ * 一个凭据引用的**值**（先凭据域、再进程环境）。给搜索腿与「查额度」共用。
+ * 空串一律当"没配"，避免把空 key 发出去换来一个误导性的 401。
+ */
+export async function resolveCredentialValue(ctx, reference) {
+	if (!REF_PATTERN.test(reference)) return undefined
+	const credentials = ctx.get('credentials')
+	if (credentials !== undefined) {
+		try {
+			const resolved = await credentials.resolve(reference)
+			const value = resolved?.value
+			if (typeof value === 'string' && value.length > 0) return value.trim()
+		} catch {
+			// 落到进程环境
+		}
+	}
+	const ambient = process.env[reference]
+	return typeof ambient === 'string' && ambient.length > 0 ? ambient.trim() : undefined
+}
+
+/**
+ * 查**上游**额度（目前只有 Tavily 提供 `GET /usage`；腾讯云没有对应接口，元宝只能靠本地账本）。
+ *
+ * 返回每个 id 一条：
+ * - `{ok:true, plan, planUsage, planLimit, keyUsage, keyLimit, searchUsage}`（Tavily 的字段名照抄官方）
+ * - `{ok:false, error}`：`unknown-source` / `unsupported-kind` / `credential-missing` / `HTTP 4xx` / `timeout` …
+ *
+ * @param ctx - 插件上下文（用于凭据域）。
+ * @param ids - 要查的源 id 列表。
+ * @param options - `{baseURL, timeoutMs}`（测试注入用）。
+ */
+export async function queryUsage(ctx, ids, options = {}) {
+	const { doc } = readConfigDocument(configPath())
+	const baseURL = (optionalString(options.baseURL) ?? TAVILY_DEFAULT_BASE_URL).replace(/\/+$/u, '')
+	const timeoutMs = Number.isInteger(options.timeoutMs) ? options.timeoutMs : 10000
+	const wanted = Array.isArray(ids) ? ids.filter((id) => typeof id === 'string').slice(0, MAX_SOURCES) : []
+	const results = {}
+	for (const id of wanted) {
+		const source = doc.sources.find((candidate) => candidate.id === id)
+		if (source === undefined) {
+			results[id] = { ok: false, error: 'unknown-source' }
+			continue
+		}
+		if (source.kind !== 'tavily') {
+			results[id] = { ok: false, error: 'unsupported-kind' }
+			continue
+		}
+		const key = await resolveCredentialValue(ctx, source.ref)
+		if (key === undefined) {
+			results[id] = { ok: false, error: 'credential-missing' }
+			continue
+		}
+		try {
+			const response = await fetch(`${baseURL}/usage`, {
+				method: 'GET',
+				redirect: 'error',
+				headers: { authorization: `Bearer ${key}`, accept: 'application/json', 'user-agent': USER_AGENT },
+				signal: AbortSignal.timeout(timeoutMs),
+			})
+			const text = await response.text()
+			let payload
+			try {
+				payload = JSON.parse(text)
+			} catch {
+				results[id] = { ok: false, error: `non-JSON body (HTTP ${response.status})` }
+				continue
+			}
+			if (!response.ok) {
+				const detail = typeof payload?.detail?.error === 'string' ? payload.detail.error : `HTTP ${response.status}`
+				results[id] = { ok: false, error: detail }
+				continue
+			}
+			const account = payload?.account ?? {}
+			const keyInfo = payload?.key ?? {}
+			results[id] = {
+				ok: true,
+				plan: optionalString(account.current_plan),
+				planUsage: Number.isInteger(account.plan_usage) ? account.plan_usage : null,
+				planLimit: Number.isInteger(account.plan_limit) ? account.plan_limit : null,
+				keyUsage: Number.isInteger(keyInfo.usage) ? keyInfo.usage : null,
+				keyLimit: Number.isInteger(keyInfo.limit) ? keyInfo.limit : null,
+				searchUsage: Number.isInteger(account.search_usage) ? account.search_usage : null,
+			}
+		} catch (error) {
+			results[id] = { ok: false, error: error?.name === 'TimeoutError' ? 'timeout' : String(error?.message ?? error) }
+		}
+	}
+	return { ok: true, month: beijingMonthKey(Date.now()), results }
 }
 
 /** 返回 `{status, payload}`：路由处理器只负责把它塞进 Response。 */
@@ -1200,6 +1349,10 @@ export async function routeFetch(ctx, request) {
 			body = await request.json()
 		} catch {
 			return Response.json({ ok: false, code: 'BAD_JSON', message: 'body must be JSON' }, { status: 400 })
+		}
+		// 「查额度」动作：只读上游用量，不碰配置（所以不走 applyConfig 的全有全无校验）
+		if (Array.isArray(body?.queryUsage)) {
+			return Response.json(await queryUsage(ctx, body.queryUsage), { status: 200 })
 		}
 		const { status, payload } = await applyConfig(ctx, body)
 		return Response.json(payload, { status })

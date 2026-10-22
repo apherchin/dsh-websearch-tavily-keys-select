@@ -50,6 +50,18 @@ API 概览里**只有 `SearchPro` 一个接口**，没有配额查询接口 ⇒ 
 > 本地账本只统计**本机这个 DSH 走这条链**的调用；如果同一个 SecretId 还被别的工具用过，账本会偏小 ⇒ 所以默认留了 `reserve` 余量，
 > 并且卡片上「本月已用」可以**手动校准**（填成控制台/账单上的数字，保存即生效）。
 
+#### 两类源，两种计量单位
+
+| 源 | 计量单位 | 官方查额度接口 | 卡片上能看到 |
+|---|---|---|---|
+| 腾讯元宝搜索 | **调用次数**（每次 1） | ❌ 没有（只能看控制台/账单/监控） | 本月已用 X / Y 次、剩余、活动额度 |
+| DeepSeek 搜索 API | **调用次数**（5 元/千次，成功才计费） | ❌ 没有 | 本月已用 X 次（不设预算时不封顶） |
+| Tavily | **credit**（basic 搜索 1、advanced 2） | ✅ `GET https://api.tavily.com/usage` | 本月已用 X credits；点「查额度」还会显示**上游**的套餐已用/上限（如 `Researcher 1000/1000`），用满会标红 |
+
+> Tavily 的「查额度」是只读动作：不保存配置、不消耗 credit，Key 由宿主代发，界面看不到明文。
+> 本地账本的 `credits` 与上游 `plan_usage` 可以互相印证：差值就是"被别的工具用掉的"（或校准误差）。
+> 预算（`budget.monthly` / `reserve`）**按各源自己的单位**生效：元宝填 2000 是 2000 次，Tavily 填 1000 是 1000 credits。
+
 #### 怎么控额度（默认就已经在控）
 
 1. **硬闸门**：`budget.monthly`（日常额度）+ `budget.reserve`（保留不用的余量）。可用 = `monthly − reserve`；
@@ -94,7 +106,7 @@ dsh plugin --profile <你的 profile> add dsh-websearch-tavily-keys-select
 | 路径 | 作用 |
 |---|---|
 | `$DSH_HOME\web-search-chain.json` | **源列表（唯一真源）**，每次搜索重读；损坏或超 64 KB 时按默认值工作 |
-| `$DSH_HOME\web-search-chain-usage.json` | **本地额度账本**（按北京时间 `YYYY-MM` 分桶）；坏了按 0 计（保留余量兜底） |
+| `$DSH_HOME\web-search-chain-usage.json` | **本地额度账本**（按北京时间 `YYYY-MM` 分桶，v2 记 `{calls, credits}`）；坏了按 0 计（保留余量兜底） |
 | `$DSH_HOME\web-search-chain-state.json` | **运行时状态**：连续失败计数 + 自动停用标记；与配置分开存，删掉它就等于"全部恢复"（源本身一个都不少） |
 | `$DSH_HOME\.credentials.yaml` | **明文密钥**进 DSH 凭据域（`refs` 段，引用名 `WEB_SEARCH_TAVILY_<n>`） |
 | `$DSH_HOME\web-search-chain.log` | **审计日志**：哪条源服务了、何时走了官方兜底、何时因额度被跳过 |
@@ -110,8 +122,8 @@ dsh plugin --profile <你的 profile> add dsh-websearch-tavily-keys-select
 ### 测试（离线，任意 cwd）
 
 ```powershell
-node test\run-all.mjs         # 9 个测试文件 / 153 条（含 manifest 11、route 33、core-budget 14、tencent-sign 9）
-node test\verify-client.mjs   # 客户端验证台：76/76（含合规守卫、注册 key 动态比对）
+node test\run-all.mjs         # 9 个测试文件 / 160 条（含 manifest 11、route 35、core-budget 14、tencent-sign 9）
+node test\verify-client.mjs   # 客户端验证台：80/80（含合规守卫、注册 key 动态比对）
 node test\make-mutants.mjs    # 变异测试：11/11 必须被杀（含"拆掉额度闸门""月份键改 UTC""签名不做小写""停用的源照样被搜"）
 ```
 

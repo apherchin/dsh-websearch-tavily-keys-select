@@ -61,10 +61,11 @@ const MUTANTS = [
 	},
 	{
 		// 额度闸门是本插件唯一"能替用户省钱"的东西：闸门失效 ⇒ 超额按 20 元/千次计费。
+		// 2026-10-22 起 Tavily 腿也有闸门（按 credit），所以这里锚在"按单位算 used"那一行，保证唯一。
 		name: 'M6 拆掉额度闸门（超额照发，会真花钱）',
 		file: 'bundle/host/index-v5.mjs',
-		find: 'if (status.exhausted) {',
-		replace: 'if (false) {',
+		find: 'const status = budgetStatus(source, usedInUnit, this.now())',
+		replace: 'const status = { exhausted: false, monthly: null, reserve: 0, used: 0, remaining: null, unlimited: true }',
 		test: 'test/chain-provider.test.mjs',
 	},
 	{

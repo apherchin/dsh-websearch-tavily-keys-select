@@ -220,9 +220,17 @@ export function budgetStatus(source, used, nowMs = Date.now()) {
 }
 //#endregion
 
-//#region 用量文档（本地计数，腾讯云没有查配额接口）
-/** 用量文档版本。 */
-export const USAGE_VERSION = 1
+//#region 用量文档（本地账本；腾讯云没有查配额接口，Tavily 有 /usage）
+/**
+ * 用量文档版本。
+ *
+ * v1：`{months:{YYYY-MM:{s1: 3}}}`（只有调用次数）
+ * v2：`{months:{YYYY-MM:{s1: {calls: 3, credits: 5}}}}`（多一个"计费单位"）
+ *
+ * 为什么 v2 要记 credits：Tavily 按 **credit** 计量（basic 搜索 1、advanced 2），一次调用不等于一个额度；
+ * 元宝 / DS 搜索 API 按**调用次数**计费，credits 恒等于 calls（不写这个字段）。
+ */
+export const USAGE_VERSION = 2
 
 /** 空用量文档。 */
 export function emptyUsageDocument() {
@@ -231,7 +239,7 @@ export function emptyUsageDocument() {
 
 /**
  * 解析用量文档文本。**任何问题都不抛**：坏数据当成「没用过」比让搜索挂掉好。
- * 形状不对但能读的月份/计数会被丢弃（只保留合法的）。
+ * 形状不对但能读的月份/计数会被丢弃（只保留合法的）。v1 的数字按 `{calls}` 读入。
  *
  * @param text - 文件内容。
  * @returns `{doc, error}`；`doc` 恒可用。
@@ -253,8 +261,20 @@ export function parseUsageText(text) {
 		const clean = {}
 		for (const [id, value] of Object.entries(counters)) {
 			if (!ID_PATTERN.test(id)) continue
-			if (!Number.isInteger(value) || value < 0) continue
-			clean[id] = value
+			// v1：数字 = 调用次数；v2：`{calls, credits}`（缺哪个都行）
+			const entry = Number.isInteger(value)
+				? value >= 0
+					? { calls: value }
+					: undefined
+				: isPlainObject(value)
+					? {
+							...(Number.isInteger(value.calls) && value.calls >= 0 ? { calls: value.calls } : {}),
+							...(Number.isInteger(value.credits) && value.credits >= 0 ? { credits: value.credits } : {}),
+						}
+					: undefined
+			if (entry === undefined) continue
+			if (entry.calls === undefined && entry.credits === undefined) continue
+			clean[id] = entry
 		}
 		months[month] = clean
 	}
@@ -266,33 +286,68 @@ export function serializeUsageDocument(doc) {
 	return `${JSON.stringify({ version: USAGE_VERSION, months: doc.months }, null, 2)}\n`
 }
 
-/** 读某月某源的已用次数（没有就是 0）。 */
-export function usageCount(doc, month, sourceId) {
+/** 某月某源的账本条目 `{calls, credits}`（没有就是两个 0）。 */
+export function usageEntry(doc, month, sourceId) {
 	const value = doc?.months?.[month]?.[sourceId]
-	return Number.isInteger(value) && value >= 0 ? value : 0
+	if (Number.isInteger(value) && value >= 0) return { calls: value, credits: 0 }
+	return {
+		calls: Number.isInteger(value?.calls) && value.calls >= 0 ? value.calls : 0,
+		credits: Number.isInteger(value?.credits) && value.credits >= 0 ? value.credits : 0,
+	}
+}
+
+/** 读某月某源的已用调用次数（没有就是 0）。 */
+export function usageCount(doc, month, sourceId) {
+	return usageEntry(doc, month, sourceId).calls
+}
+
+/** 读某月某源的已用 credit 数（没有就是 0；元宝这类按次计费的源恒为 0）。 */
+export function usageCredits(doc, month, sourceId) {
+	return usageEntry(doc, month, sourceId).credits
 }
 
 /**
- * 写入某月某源的已用次数，并**只保留本月与上月**（其余月份丢掉，文件不会长胖）。
+ * 写某月某源的账本条目，并**只保留本月与上月**（其余月份丢掉，文件不会长胖）。
  *
  * @param doc - 当前用量文档。
  * @param month - `YYYY-MM`。
  * @param sourceId - 源 id。
- * @param value - 新计数（非负整数；非法值原样保留旧计数）。
+ * @param patch - 要覆盖的字段（`calls` / `credits`；非法值忽略）。
  * @returns 新的用量文档（不原地改）。
  */
-export function withUsageCount(doc, month, sourceId, value) {
-	if (!Number.isInteger(value) || value < 0) return doc
+function withUsageEntry(doc, month, sourceId, patch) {
+	if (!/^\d{4}-\d{2}$/.test(month) || !ID_PATTERN.test(sourceId)) return doc
+	const hasCalls = Number.isInteger(patch.calls) && patch.calls >= 0
+	const hasCredits = Number.isInteger(patch.credits) && patch.credits >= 0
+	if (!hasCalls && !hasCredits) return doc
+	const current = usageEntry(doc, month, sourceId)
+	const calls = Number.isInteger(patch.calls) && patch.calls >= 0 ? patch.calls : current.calls
+	const credits = Number.isInteger(patch.credits) && patch.credits >= 0 ? patch.credits : current.credits
+	// 只写非 0 的字段：元宝这类按次计费的源永远不出现 credits，文件更小也更好读
+	const next = {}
+	if (calls > 0) next.calls = calls
+	if (credits > 0) next.credits = credits
+	if (Object.keys(next).length === 0) return doc
 	const keep = new Set([month, previousMonthKey(month)])
 	const months = {}
 	for (const [key, counters] of Object.entries(doc?.months ?? {})) {
 		if (!keep.has(key)) continue
 		months[key] = { ...counters }
 	}
-	const bucket = months[month] ?? {}
-	bucket[sourceId] = value
+	const bucket = { ...(months[month] ?? {}) }
+	bucket[sourceId] = next
 	months[month] = bucket
 	return { version: USAGE_VERSION, months }
+}
+
+/** 写入某月某源的已用**调用次数**（credits 保持不变）。 */
+export function withUsageCount(doc, month, sourceId, value) {
+	return withUsageEntry(doc, month, sourceId, { calls: value })
+}
+
+/** 写入某月某源的已用 **credit**（调用次数保持不变）。 */
+export function withUsageCredits(doc, month, sourceId, value) {
+	return withUsageEntry(doc, month, sourceId, { credits: value })
 }
 //#endregion
 

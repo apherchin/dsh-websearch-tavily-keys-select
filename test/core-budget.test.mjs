@@ -110,7 +110,7 @@ await test('用量文档：解析非法内容不抛，坏桶被丢掉', () => {
 	assert.deepEqual(parseUsageText('[]').doc, emptyUsageDocument())
 	const parsed = parseUsageText(JSON.stringify({ version: 1, months: { '2026-10': { s3: 12, bad: -1, 'no space': 3 }, nope: { s3: 5 } } }))
 	assert.equal(parsed.error, undefined)
-	assert.deepEqual(parsed.doc.months, { '2026-10': { s3: 12 } })
+	assert.deepEqual(parsed.doc.months, { '2026-10': { s3: { calls: 12 } } })
 })
 
 await test('用量文档：写入只保留本月与上月，序列化稳定', () => {
