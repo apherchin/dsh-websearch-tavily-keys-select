@@ -181,12 +181,13 @@ const YUANBAO_BUDGET = { monthly: 2000, reserve: 100, promo: { monthly: 6000, un
 const SERVER_STATE = {
 	ok: true,
 	version: 2,
-	maxSources: 3,
+	maxSources: 4,
 	templates: [
 		{ kind: 'yuanbao', label: '腾讯元宝搜索', refExample: 'TENCENTCLOUD_SECRET_KEY' },
+		{ kind: 'deepseek-api', label: 'DeepSeek 搜索 API', refExample: 'DEEPSEEK_API_KEY' },
 		{ kind: 'tavily', label: 'Tavily Key', refExample: 'TAVILY_API_KEY' },
 	],
-	defaults: { budgets: { yuanbao: YUANBAO_BUDGET, tavily: null } },
+	defaults: { budgets: { yuanbao: YUANBAO_BUDGET, 'deepseek-api': null, tavily: null } },
 	sources: [
 		{
 			id: 's1',
@@ -251,8 +252,8 @@ check('addSource(tavily)：不预填额度（null 默认）', (() => {
 	return added.kind === 'tavily' && added.budgetMonthly === '' && added.promo === null
 })())
 check('addSource：到上限就不再追加（按钮与逻辑两层都挡）', (() => {
-	const full = { sources: [0, 1, 2].map((n) => ({ id: `s${n}`, kind: 'tavily', mode: 'env', ref: `K${n}`, secret: '' })) }
-	if (!eq(I.addSource(full, SERVER_STATE.templates, 'tavily', SERVER_STATE), full)) throw new Error('追加了第 4 个源')
+	const full = { sources: [0, 1, 2, 3].map((n) => ({ id: `s${n}`, kind: 'tavily', mode: 'env', ref: `K${n}`, secret: '' })) }
+	if (!eq(I.addSource(full, SERVER_STATE.templates, 'tavily', SERVER_STATE), full)) throw new Error('追加了第 5 个源')
 	return true
 })())
 check('removeSource：按下标删且保持其它源顺序', (() => {
@@ -394,11 +395,11 @@ face.hooks.webSearchChain.set({ status: 'ready', error: null, state: SERVER_STAT
 	check('渲染：兜底行显示「已启用」', JSON.stringify(tree).includes('已启用'))
 	check('渲染：明文已配置时用「留空即保持不变」占位', inputs.some((el) => String(el.props.placeholder).includes('留空即保持不变')))
 	check('渲染：环境变量源的只读徽标出现', JSON.stringify(tree).includes('只读'))
-	check('渲染：两个模板各一个「添加」按钮（元宝 / Tavily）', findAll(tree, (el) => el.type === 'button' && String(el.props.children).startsWith('添加：')).length === 2)
+	check('渲染：三个模板各一个「添加」按钮（元宝 / DS 搜索 API / Tavily）', findAll(tree, (el) => el.type === 'button' && String(el.props.children).startsWith('添加：')).length === 3)
 }
 {
 	// 到上限：添加按钮必须置灰
-	const full = { sources: [0, 1, 2].map((n) => ({ id: `s${n}`, kind: 'tavily', mode: 'env', ref: `K${n}`, credential: { configured: false, writable: true }, secret: '', serverMode: 'env', budgetMonthly: '', budgetReserve: '', promo: null, usage: null, used: '0', serverUsed: 0 })) }
+	const full = { sources: [0, 1, 2, 3].map((n) => ({ id: `s${n}`, kind: 'tavily', mode: 'env', ref: `K${n}`, credential: { configured: false, writable: true }, secret: '', serverMode: 'env', budgetMonthly: '', budgetReserve: '', promo: null, usage: null, used: '0', serverUsed: 0 })) }
 	face.hooks.webSearchChain.set({ status: 'ready', error: null, state: SERVER_STATE, draft: full, saving: false, notice: null })
 	const tree = expandAll(reg.Comp(propsFor('page')))
 	const buttons = findAll(tree, (el) => el.type === 'button')

@@ -28,7 +28,7 @@ await test('请求体不是对象 / sources 不是数组 / 源不是对象 ⇒ I
 })
 
 await test(`超过 ${MAX_SOURCES} 个源 ⇒ TOO_MANY_SOURCES`, () => {
-	const sources = [1, 2, 3, 4].map((n) => env(undefined, `K${n}`))
+	const sources = Array.from({ length: MAX_SOURCES + 1 }, (_, index) => env(undefined, `K${index + 1}`))
 	const result = validateSubmission({ sources }, previous)
 	assert.equal(result.code, 'TOO_MANY_SOURCES')
 	assert.equal(result.ok, false)

@@ -3,7 +3,7 @@
 [中文](#中文) ｜ [English](#english)
 
 给 DeepSeek Harness 的 `web_search` 加一条**多源链路**：按顺序尝试最多 **3 个源**，全部失败或一个都没配时交给**官方 DeepSeek 搜索**兜底。
-源有两种模板：**腾讯元宝搜索**（腾讯云 `SearchPro`，SecretId + SecretKey 签名，带额度闸门）和 **Tavily**（一个 key）。
+源有三种模板：**腾讯元宝搜索**（腾讯云 `SearchPro`，SecretId + SecretKey 签名，带额度闸门）、**DeepSeek 搜索 API**（REST，5 元/千次）和 **Tavily**（一个 key）。推荐腿序：元宝 → Tavily → DS 搜索 API。
 密钥可取 Windows 环境变量，也可直接输入明文。配置卡片就在**侧栏 Plugins → bundle 包页**上。
 
 > **改配置不用重启 DSH**：链路每次搜索都重读配置文档。
@@ -80,10 +80,10 @@ dsh plugin --profile <你的 profile> add dsh-websearch-tavily-keys-select
 | 源 | 必填 | 说明 |
 |---|---|---|
 | 腾讯元宝搜索 | **SecretId** + SecretKey（环境变量名或明文）+ 可选额度 | SecretId 明文存在配置文档里（可随时改）；SecretKey 默认读 `TENCENTCLOUD_SECRET_KEY` |
-| Tavily | key（环境变量名或明文） | `TAVILY_API_KEY1` / `TAVILY_API_KEY2` 之类 |
+| DeepSeek 搜索 API | key（环境变量名或明文） | `DEEPSEEK_API_KEY`（5 元/千次，成功才计费） |\n| Tavily | key（环境变量名或明文） | `TAVILY_API_KEY1` / `TAVILY_API_KEY2` 之类 |
 
-- **源的顺序 = 尝试顺序**；最多 **3 个**源；每个源失败自动降级到下一个。
-- **官方兜底**：页面里 `DS_OFFICIAL` 那个开关（默认开）——**关掉就不花官方余额**。
+- **源的顺序 = 尝试顺序**；最多 **4 个**源；每个源失败自动降级到下一个。
+- **官方兜底**：页面里 `DS_OFFICIAL` 那个开关。本机 2026-10-22 起**已关掉**（改用 DS 搜索 API 兜底）——关掉就不花官方余额。
 - 保存后**立即生效**（下一次搜索就用新配置），无需重启。
 - 环境变量是 DSH **启动时**快照的：新加/改完 `TENCENTCLOUD_SECRET_KEY` 要**重启 DSH** 才生效。
 
@@ -107,7 +107,7 @@ dsh plugin --profile <你的 profile> add dsh-websearch-tavily-keys-select
 ### 测试（离线，任意 cwd）
 
 ```powershell
-node test\run-all.mjs         # 9 个测试文件 / 143 条（含 manifest 11、route 30、core-budget 14、tencent-sign 9）
+node test\run-all.mjs         # 9 个测试文件 / 146 条（含 manifest 11、route 30、core-budget 14、tencent-sign 9）
 node test\verify-client.mjs   # 客户端验证台：71/71（含合规守卫、注册 key 动态比对）
 node test\make-mutants.mjs    # 变异测试：10/10 必须被杀（含"拆掉额度闸门""月份键改 UTC""签名不做小写"）
 ```
@@ -118,8 +118,8 @@ node test\make-mutants.mjs    # 变异测试：10/10 必须被杀（含"拆掉�
 
 ## English
 
-A **multi-source web-search chain** for DeepSeek Harness: try up to **3 sources** in order, and fall back to the **official DeepSeek search** when every source fails or none is configured.
-Two source templates: **Tencent Yuanbao Search** (Tencent Cloud `SearchPro`, SecretId + SecretKey signature, with a local quota gate) and **Tavily** (a single key).
+A **multi-source web-search chain** for DeepSeek Harness: try up to **4 sources** in order, and fall back to the **official DeepSeek search** when every source fails or none is configured.
+Three source templates: **Tencent Yuanbao Search** (Tencent Cloud `SearchPro`, SecretId + SecretKey signature, with a local quota gate), **DeepSeek Search API** (REST, 5 CNY/1000) and **Tavily** (a single key). Recommended order: Yuanbao → Tavily → DeepSeek Search API.
 Keys come from Windows environment variables or can be typed in as plaintext. The configuration card lives on the bundle's **Plugins** page.
 
 > **No restart needed** to change the configuration — the chain re-reads its config document on every search.
@@ -169,7 +169,7 @@ Host side has **zero `@deepseek-ai` static imports** (the official fallback is a
 ### Tests
 
 ```powershell
-node test\run-all.mjs         # 9 files / 143 tests
+node test\run-all.mjs         # 9 files / 146 tests
 node test\verify-client.mjs   # 71/71, including compliance guards
 node test\make-mutants.mjs    # 10/10 mutants must be killed
 ```

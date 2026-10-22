@@ -37,11 +37,11 @@ const MUTANTS = [
 		test: 'test/core-validate.test.mjs',
 	},
 	{
-		name: 'M3 上限 3 改成 4',
+		name: 'M3 上限 4 改成 5',
 		file: 'bundle/host/core.mjs',
-		find: 'export const MAX_SOURCES = 3',
-		replace: 'export const MAX_SOURCES = 4',
-		test: 'test/core-validate.test.mjs',
+		find: 'export const MAX_SOURCES = 4',
+		replace: 'export const MAX_SOURCES = 5',
+		test: 'test/core-document.test.mjs',
 	},
 	{
 		name: 'M4 删掉「只读凭据不 unset」的守卫（会跟环境变量较劲）',

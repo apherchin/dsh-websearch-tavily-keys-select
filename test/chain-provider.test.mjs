@@ -399,5 +399,72 @@ await test('yuanbao 缺 SecretId ⇒ 记 credential-missing，不发请求', asy
 })
 //#endregion
 
+//#region DeepSeek 搜索 REST API 腿（2026-10-22 用户决定：官方 Messages 兜底关掉，用它兜底）
+await test('deepseek-api 腿：Bearer + /search + 结果映射，且作为元宝额度用尽后的兜底', async () => {
+	const credentials = makeFakeCredentials({ values: { [SECRET_KEY_REF]: 'sk-test', DEEPSEEK_API_KEY: 'ds-key' } })
+	const { provider } = mountChain({
+		credentials,
+		chain: { deepseekApi: { baseURL: 'https://deepseek-api.invalid/v1/tools', count: 10, timeoutMs: 3000 } },
+	})
+	resetUsage()
+	// 元宝预算 1 且已用 1 ⇒ 到点；下一条就是 DS 搜索 API
+	setDoc([yuanbaoSource({ budget: { monthly: 1, reserve: 0 } }), { id: 's2', kind: 'deepseek-api', mode: 'env', ref: 'DEEPSEEK_API_KEY' }])
+	writeUsageDocument(usagePath(), { months: { [beijingMonthKey(Date.now())]: { s1: 1 } } })
+	let seen
+	stubFetch(async (url, init) => {
+		seen = { url, init }
+		return new Response(
+			JSON.stringify({
+				results: [
+					{ url: 'https://ds.example/1', title: '标题', snippet: '摘要', date: '2026-10-22' },
+					{ url: 'https://ds.example/1', title: '重复' },
+					{ title: '无 url' },
+				],
+			}),
+			{ status: 200, headers: { 'content-type': 'application/json' } },
+		)
+	})
+	try {
+		const result = await provider.search({ query: 'q' }, undefined)
+		assert.equal(seen.url, 'https://deepseek-api.invalid/v1/tools/search')
+		assert.equal(seen.init.method, 'POST')
+		assert.equal(seen.init.headers.authorization, 'Bearer ds-key')
+		assert.deepEqual(JSON.parse(seen.init.body), { query: 'q', count: 10, need_content: false })
+		assert.deepEqual(result.sources, [{ url: 'https://ds.example/1', title: '标题', snippet: '摘要', publishedAt: '2026-10-22' }])
+		const log = readFileSync(`${dir}\\web-search-chain.log`, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+		const served = log.filter((entry) => entry.outcome === 'served').at(-1)
+		assert.equal(served.target, 'deepseek-api')
+		assert.equal(served.slot, 's2')
+	} finally {
+		stubFetch(realFetch)
+	}
+})
+
+await test('deepseek-api 腿：HTTP 429 ⇒ RATE_LIMIT，带出 error.message；推进到下一条', async () => {
+	const credentials = makeFakeCredentials({ values: { DEEPSEEK_API_KEY: 'ds-key', K2: 'k2' } })
+	const { provider } = mountChain({ credentials })
+	resetUsage()
+	setDoc([
+		{ id: 's1', kind: 'deepseek-api', mode: 'env', ref: 'DEEPSEEK_API_KEY' },
+		{ id: 's2', kind: 'tavily', mode: 'env', ref: 'K2' },
+	])
+	let call = 0
+	stubFetch(async () => {
+		call += 1
+		if (call === 1) {
+			return new Response(JSON.stringify({ error: { message: 'slow down' } }), { status: 429, headers: { 'content-type': 'application/json' } })
+		}
+		return tavilyOk(['https://served-by-s2'])
+	})
+	try {
+		const result = await provider.search({ query: 'q' }, undefined)
+		assert.equal(call, 2)
+		assert.deepEqual(result.sources.map((source) => source.url), ['https://served-by-s2'])
+	} finally {
+		stubFetch(realFetch)
+	}
+})
+//#endregion
+
 summary('chain-provider')
 cleanup(dir)

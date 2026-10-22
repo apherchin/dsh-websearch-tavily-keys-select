@@ -1,6 +1,6 @@
 # dsh-web-search-chain（正本）
 
-DSH 的 Web 搜索链路：`元宝搜索（腾讯云 SearchPro，带额度闸门）/ Tavily（0~3 个源）→ 官方 DeepSeek 搜索兜底`，
+DSH 的 Web 搜索链路：`元宝搜索（腾讯云 SearchPro，带额度闸门）→ Tavily（0~2 个）→ DeepSeek 搜索 API（5 元/千次）→ 官方 DeepSeek 搜索兜底（本机已关）`，
 并在侧栏 Plugins 的本包页面提供配置卡片（**Windows 环境变量 / 明文**两种密钥来源）。
 **面向用户的说明见 [`bundle/README.md`](bundle/README.md)**（含额度/计费/查额度与控额度的完整说明）；本文件只写开发侧约定。
 
@@ -66,7 +66,7 @@ node sync-to-profile.mjs --npm-check  # 只看发布布局的差异
 ## 测试（逐文件跑，本机 `node --test` 必失败——沙箱禁命名管道）
 
 ```powershell
-node test\run-all.mjs          # 全部 *.test.mjs（进程内汇总；当前 9 文件 / 143 条）
+node test\run-all.mjs          # 全部 *.test.mjs（进程内汇总；当前 9 文件 / 146 条）
 node test\verify-client.mjs    # 客户端验证台（vm + 假 react/jsx + 合规守卫 + 注册 key 动态比对；71/71）
 node test\make-mutants.mjs     # 变异测试：10 个变异必须全部被杀
 ```

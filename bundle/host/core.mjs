@@ -11,8 +11,13 @@
  *   并且**带额度闸门**（免费额度 2000 次/自然月/UIN，限时活动 6000，超额按量计费且单价高）。
  */
 
-/** 源数量上限（界面与 Host 两侧都按它约束）。 */
-export const MAX_SOURCES = 3
+/**
+ * 源数量上限（界面与 Host 两侧都按它约束）。
+ *
+ * 2026-10-22 由 3 提到 4：典型腿序是 **元宝（免费额度）→ Tavily key1 → Tavily key2 → DS 搜索 API**，
+ * 四条都要能同时配在链里。上限只是防呆，不改变"按文档顺序尝试"的语义。
+ */
+export const MAX_SOURCES = 4
 /** 配置文件体积上限：超过即视同损坏。 */
 export const MAX_DOCUMENT_BYTES = 65536
 /** 凭据引用名文法（与凭据域一致：POSIX shell 标识符）。 */
@@ -48,6 +53,7 @@ export const MAX_MONTHLY_BUDGET = 10000000
  */
 export const TEMPLATES = [
 	{ kind: 'yuanbao', label: '腾讯元宝搜索', refExample: 'TENCENTCLOUD_SECRET_KEY' },
+	{ kind: 'deepseek-api', label: 'DeepSeek 搜索 API', refExample: 'DEEPSEEK_API_KEY' },
 	{ kind: 'tavily', label: 'Tavily Key', refExample: 'TAVILY_API_KEY' },
 ]
 

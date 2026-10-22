@@ -33,7 +33,7 @@ window.__ModuleLoader__.load({
 		const CONFIG_PATH = "/api/web-search-chain.config";
 		const SLOT = "plugins.bundle.config";
 		const ENTRY_KEY = "dsh-websearch-tavily-keys-select";
-		const MAX_SOURCES = 3;
+		const MAX_SOURCES = 4;
 		const REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 		/** SecretId 的宽松校验（与 core.mjs 的 SECRET_ID_PATTERN 保持一致）。 */
 		const SECRET_ID_PATTERN = /^\S{6,128}$/;
@@ -272,11 +272,19 @@ window.__ModuleLoader__.load({
 			return budget === undefined ? null : budget;
 		}
 		/**
+		 * 源数量上限：以**服务端**给的 `state.maxSources` 为准（升级上限时界面不必跟着改），
+		 * 没拿到时退回本文件的常量。`MAX_SOURCES` 只是兜底值。
+		 */
+		function maxSourcesOf(state) {
+			const value = state?.maxSources;
+			return Number.isInteger(value) && value > 0 ? value : MAX_SOURCES;
+		}
+		/**
 		 * 追加一个源：`kind` 指定模板（缺省取表内第一项）。
 		 * 新 yuanbao 源把**模板默认额度**预填进输入框，这样它和"不填"的语义一致（含活动额度）。
 		 */
 		function addSource(draft, templates, kind, state) {
-			if (draft.sources.length >= MAX_SOURCES) return draft;
+			if (draft.sources.length >= maxSourcesOf(state)) return draft;
 			const table = templates ?? [];
 			const template = table.find((candidate) => candidate.kind === kind) ?? table[0] ?? { kind: "tavily" };
 			const budget = templateBudget(state, template.kind);
@@ -699,13 +707,14 @@ window.__ModuleLoader__.load({
 			if (draft === null) return jsx("p", { style: S.intro, children: copy.loading });
 			const state = snapshot.state;
 			const problem = firstProblem(draft);
-			const atLimit = draft.sources.length >= MAX_SOURCES;
+			const maxSources = maxSourcesOf(state);
+			const atLimit = draft.sources.length >= maxSources;
 			const templates = state?.templates ?? [];
 			const recycling = recycledRefs(state, draft);
 			return jsxs("div", {
 				style: S.card,
 				children: [
-					jsx("p", { style: S.intro, children: copy.intro(MAX_SOURCES) }),
+					jsx("p", { style: S.intro, children: copy.intro(maxSources) }),
 					typeof state?.configError === "string" && state.configError.length > 0
 						? jsx("p", { style: S.banner, children: `${copy.configBroken}${state.configError}` })
 						: null,
@@ -716,7 +725,7 @@ window.__ModuleLoader__.load({
 							jsx(
 								AtomButton,
 								{
-									children: atLimit ? copy.addLimit(MAX_SOURCES) : copy.addTemplate(template.label),
+									children: atLimit ? copy.addLimit(maxSources) : copy.addTemplate(template.label),
 									disabled: atLimit,
 									onClick: () => props.edit({ kind: "add", value: template.kind }),
 								},
@@ -893,6 +902,7 @@ window.__ModuleLoader__.load({
 			setUsed,
 			removeSource,
 			addSource,
+			maxSourcesOf,
 			toInteger,
 			budgetOf,
 			toRequest,

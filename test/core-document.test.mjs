@@ -33,7 +33,7 @@ await test('默认文档每次返回新对象（不许共享可变状态）', ()
 })
 
 await test('模板表：yuanbao 在前、tavily 在后（界面按这个顺序渲染"添加"按钮）', () => {
-	assert.deepEqual(TEMPLATES.map((template) => template.kind), ['yuanbao', 'tavily'])
+	assert.deepEqual(TEMPLATES.map((template) => template.kind), ['yuanbao', 'deepseek-api', 'tavily'])
 	assert.equal(TEMPLATES[0].refExample, 'TENCENTCLOUD_SECRET_KEY')
 })
 
@@ -71,8 +71,12 @@ await test('根不是对象 / sources 不是数组 ⇒ 退默认 + error', () =>
 	assert.ok(parseDocumentText('{"sources":[1]}').error !== undefined)
 })
 
+await test('源数量上限就是 4（改大/改小都必须同步界面文案、变异脚本与测试）', () => {
+	assert.equal(MAX_SOURCES, 4)
+})
+
 await test(`超过 ${MAX_SOURCES} 个源 ⇒ 退默认 + error`, () => {
-	const sources = [1, 2, 3, 4].map((n) => ({ id: `s${n}`, kind: 'tavily', mode: 'env', ref: `K${n}` }))
+	const sources = Array.from({ length: MAX_SOURCES + 1 }, (_, index) => ({ id: `s${index + 1}`, kind: 'tavily', mode: 'env', ref: `K${index + 1}` }))
 	const parsed = parseDocumentText(JSON.stringify({ version: DOCUMENT_VERSION, sources }))
 	assert.ok(parsed.error.includes('more than'), parsed.error)
 	assert.deepEqual(parsed.doc, defaultDocument())

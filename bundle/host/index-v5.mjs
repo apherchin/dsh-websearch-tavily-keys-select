@@ -54,6 +54,14 @@ const DEFAULT_FALLBACK_REF = 'DEEPSEEK_API_KEY'
 const TAVILY_DEFAULT_BASE_URL = 'https://api.tavily.com'
 /** 官方 DeepSeek Anthropic 兼容端点缺省值；`/messages` 由官方 provider 拼。 */
 const DEEPSEEK_DEFAULT_BASE_URL = 'https://api.deepseek.com/anthropic/v1'
+/**
+ * DeepSeek **搜索 REST API** 端点缺省值（`/search` 由本模块拼）。
+ *
+ * 与上面那个 Anthropic 兼容端点不是一回事：这里是直连 `POST /v1/tools/search`，
+ * 按成功请求计费（2026-10-18 实测 5 元/千次），比元宝标准版（20 元/千次）便宜 4 倍
+ * ⇒ 用户 2026-10-22 决定：**元宝优先，DS 搜索 API 兜底，官方 Messages 兜底关掉**。
+ */
+const DEEPSEEK_API_DEFAULT_BASE_URL = 'https://api.deepseek.com/v1/tools'
 /** 元宝搜索端点缺省值（就近地域接入域名）。 */
 const YUANBAO_DEFAULT_BASE_URL = 'https://wsa.tencentcloudapi.com'
 /** 元宝搜索 API 版本（`SearchPro` 所属版本）。 */
@@ -167,6 +175,7 @@ export function normalizeChain(config) {
 	const tavily = source.tavily ?? {}
 	const deepseek = source.deepseek ?? {}
 	const yuanbao = source.yuanbao ?? {}
+	const deepseekApi = source.deepseekApi ?? {}
 	const tavilyBaseURL = optionalString(tavily.baseURL) ?? optionalString(source.tavilyBaseURL) ?? TAVILY_DEFAULT_BASE_URL
 	return {
 		id: optionalString(source.id) ?? 'tavily-chain',
@@ -181,6 +190,11 @@ export function normalizeChain(config) {
 		deepseekApiVersion: optionalString(deepseek.apiVersion) ?? '2023-06-01',
 		deepseekMaxTokens: clampInteger(deepseek.maxTokens, 1, Number.MAX_SAFE_INTEGER, 4096),
 		deepseekMaxUses: clampInteger(deepseek.maxUses, 1, Number.MAX_SAFE_INTEGER, 5),
+		deepseekApi: {
+			baseURL: (optionalString(deepseekApi.baseURL) ?? DEEPSEEK_API_DEFAULT_BASE_URL).replace(/\/+$/u, ''),
+			count: clampInteger(deepseekApi.count, 1, 50, 10),
+			timeoutMs: clampInteger(deepseekApi.timeoutMs, 1, 600000, 30000),
+		},
 		yuanbao: {
 			baseURL: (optionalString(yuanbao.baseURL) ?? YUANBAO_DEFAULT_BASE_URL).replace(/\/+$/u, ''),
 			version: optionalString(yuanbao.version) ?? YUANBAO_API_VERSION,
@@ -224,6 +238,32 @@ function mapTavilySources(payload) {
 			...(typeof item.title === 'string' && item.title.length > 0 ? { title: item.title } : {}),
 			...(typeof item.content === 'string' && item.content.length > 0 ? { snippet: item.content } : {}),
 			...(typeof item.published_date === 'string' && item.published_date.length > 0 ? { publishedAt: item.published_date } : {}),
+		})
+	}
+	return sources
+}
+
+/**
+ * 把 DeepSeek 搜索 REST API 的 `{results:[…]}` 映射成 seam 的 `WebSearchResult.sources`。
+ *
+ * 形状：`results[]` 里每项 `{url, title?, snippet?, date?}`（`need_content:false` 时没有正文）。
+ * 与 Tavily 的映射刻意分开写：两家的字段名不同（`snippet` vs `content`），
+ * 合并成一个函数会让"改一家影响另一家"。
+ *
+ * @param payload - `POST /search` 的响应体。
+ */
+export function mapDeepseekApiSources(payload) {
+	const sources = []
+	const seen = new Set()
+	for (const item of Array.isArray(payload?.results) ? payload.results : []) {
+		const url = typeof item?.url === 'string' ? item.url : ''
+		if (url.length === 0 || seen.has(url)) continue
+		seen.add(url)
+		sources.push({
+			url,
+			...(typeof item.title === 'string' && item.title.length > 0 ? { title: item.title } : {}),
+			...(typeof item.snippet === 'string' && item.snippet.length > 0 ? { snippet: item.snippet } : {}),
+			...(typeof item.date === 'string' && item.date.length > 0 ? { publishedAt: item.date } : {}),
 		})
 	}
 	return sources
@@ -478,16 +518,21 @@ export class ChainSearchProvider {
 				}
 			}
 
+			// deepseek-api 与 tavily 都是「一把 key + 一个 REST 端点」，共用同一个失败推进形状
+			const target = leg.kind === 'deepseek-api' ? 'deepseek-api' : 'tavily'
 			try {
-				const result = await this.searchTavily(config, apiKey, request, signal)
+				const result =
+					leg.kind === 'deepseek-api'
+						? await this.searchDeepseekApi(config, apiKey, request, signal)
+						: await this.searchTavily(config, apiKey, request, signal)
 				this.record(config, {
 					outcome: 'served',
-					target: 'tavily',
+					target,
 					slot: leg.id,
 					ref: leg.ref,
 					query: request.query,
 					sources: result.sources.length,
-					credits: result.credits,
+					...(result.credits === undefined ? {} : { credits: result.credits }),
 					priorAttempts: attempts,
 				})
 				return { sources: result.sources, truncated: false }
@@ -543,6 +588,62 @@ export class ChainSearchProvider {
 			if (signal?.aborted === true) throw error
 			if (link.didTimeOut()) {
 				throw new ChainError(`Tavily search timed out after ${config.timeoutMs}ms`, 'TIMEOUT')
+			}
+			throw error
+		} finally {
+			link.dispose()
+		}
+	}
+
+	/**
+	 * 一次 DeepSeek **搜索 REST API** 调用（`POST {baseURL}/search`，Bearer `DEEPSEEK_API_KEY`）。
+	 *
+	 * 与官方 Messages 兜底的区别：这条是**按成功请求计费**的 REST 接口（2026-10-18 实测 5 元/千次），
+	 * 比元宝标准版（20 元/千次）便宜 4 倍，所以 2026-10-22 用户决定用它替代官方 Messages 兜底。
+	 * 计费口径是"成功的请求"，失败/超时不计费（与元宝一致）。
+	 *
+	 * @param config - 归一化链配置（读 `config.deepseekApi`）。
+	 * @param apiKey - `DEEPSEEK_API_KEY` 的值。
+	 * @param request - seam 的搜索请求。
+	 * @param signal - 调用方取消信号。
+	 */
+	async searchDeepseekApi(config, apiKey, request, signal) {
+		const settings = config.deepseekApi
+		const endpoint = `${settings.baseURL}/search`
+		const count = Math.max(1, Math.min(settings.count, Number.isInteger(request.maxResults) && request.maxResults > 0 ? request.maxResults : settings.count))
+		const link = linkAbort(signal, settings.timeoutMs)
+		try {
+			const response = await fetch(endpoint, {
+				method: 'POST',
+				redirect: 'error',
+				headers: {
+					authorization: `Bearer ${apiKey}`,
+					'content-type': 'application/json',
+					accept: 'application/json',
+					'user-agent': USER_AGENT,
+				},
+				body: JSON.stringify({ query: request.query, count, need_content: false }),
+				signal: link.signal,
+			})
+			const text = await response.text()
+			let payload
+			try {
+				payload = JSON.parse(text)
+			} catch {
+				throw new ChainError(`DeepSeek search API returned a non-JSON body (HTTP ${response.status})`, 'WEB_PROVIDER_ERROR')
+			}
+			if (!response.ok) {
+				const detail = typeof payload?.error?.message === 'string' ? payload.error.message : text.slice(0, 200)
+				throw new ChainError(`DeepSeek search API failed (HTTP ${response.status}): ${detail}`, response.status === 429 ? 'RATE_LIMIT' : 'WEB_PROVIDER_ERROR')
+			}
+			if (!Array.isArray(payload?.results)) {
+				throw new ChainError('DeepSeek search API returned no results array', 'WEB_PROVIDER_ERROR')
+			}
+			return { sources: mapDeepseekApiSources(payload) }
+		} catch (error) {
+			if (signal?.aborted === true) throw error
+			if (link.didTimeOut()) {
+				throw new ChainError(`DeepSeek search API timed out after ${settings.timeoutMs}ms`, 'TIMEOUT')
 			}
 			throw error
 		} finally {

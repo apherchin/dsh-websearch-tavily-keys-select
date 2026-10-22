@@ -81,6 +81,7 @@ await test('GET：文件不存在时给默认文档 + 默认凭据状态 + 模�
 	assert.equal(body.maxSources, MAX_SOURCES)
 	assert.deepEqual(body.templates, [
 		{ kind: 'yuanbao', label: '腾讯元宝搜索', refExample: 'TENCENTCLOUD_SECRET_KEY' },
+		{ kind: 'deepseek-api', label: 'DeepSeek 搜索 API', refExample: 'DEEPSEEK_API_KEY' },
 		{ kind: 'tavily', label: 'Tavily Key', refExample: 'TAVILY_API_KEY' },
 	])
 	const month = beijingMonthKey(Date.now())
@@ -94,7 +95,11 @@ await test('GET：文件不存在时给默认文档 + 默认凭据状态 + 模�
 		{ id: 's2', kind: 'tavily', mode: 'env', ref: 'TAVILY_API_KEY2', budget: null, credential: { configured: false, writable: true }, usage: unlimitedUsage },
 	])
 	assert.deepEqual(body.defaults, {
-		budgets: { yuanbao: { monthly: 2000, reserve: 100, promo: { monthly: 6000, until: '2026-11-30' } }, tavily: null },
+		budgets: {
+			yuanbao: { monthly: 2000, reserve: 100, promo: { monthly: 6000, until: '2026-11-30' } },
+			'deepseek-api': null,
+			tavily: null,
+		},
 	})
 	assert.deepEqual(body.fallback, { kind: 'deepseek', enabled: false })
 	assert.equal(body.configError, null)
@@ -141,7 +146,7 @@ await test('POST 校验失败 ⇒ 400 + code/field，且**一个字节都不写*
 	const before = readConfigDocument(configPath()).doc
 	const cases = [
 		[{ sources: 'nope' }, 'INVALID_CONFIG'],
-		[{ sources: [1, 2, 3, 4] }, 'TOO_MANY_SOURCES'],
+		[{ sources: Array.from({ length: MAX_SOURCES + 1 }, () => ({ kind: 'tavily', mode: 'env', ref: 'K' })) }, 'TOO_MANY_SOURCES'],
 		[{ sources: [{ kind: 'brave', mode: 'env', ref: 'K1' }] }, 'UNKNOWN_KIND'],
 		[{ sources: [{ kind: 'tavily', mode: 'plain', ref: 'K1' }] }, 'INVALID_CONFIG'],
 		[{ sources: [{ kind: 'tavily', mode: 'env', ref: '1BAD' }] }, 'INVALID_REF'],
