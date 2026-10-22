@@ -34,6 +34,15 @@ await test(`超过 ${MAX_SOURCES} 个源 ⇒ TOO_MANY_SOURCES`, () => {
 	assert.equal(result.ok, false)
 })
 
+await test('disabled: true 可以提交（停用不是删除）；非布尔值 ⇒ INVALID_CONFIG', () => {
+	const ok = validateSubmission({ sources: [{ ...env('s1', 'K1'), disabled: true }] }, previous)
+	assert.equal(ok.ok, true)
+	assert.equal(ok.sources[0].disabled, true)
+	assert.equal(ok.sources[0].ref, 'K1', '停用不丢字段')
+	const bad = validateSubmission({ sources: [{ ...env('s1', 'K1'), disabled: 'yes' }] }, previous)
+	assert.equal(bad.code, 'INVALID_CONFIG')
+})
+
 await test('模板不在表内 ⇒ UNKNOWN_KIND（带 field）', () => {
 	const result = validateSubmission({ sources: [{ ...env('s1', 'K1'), kind: 'brave' }] }, previous)
 	assert.equal(result.code, 'UNKNOWN_KIND')

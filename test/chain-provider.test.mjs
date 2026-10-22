@@ -215,7 +215,8 @@ await test('emptyDocument 仍是空文档（回归守卫）', () => {
 })
 
 //#region 元宝搜索腿（2026-10-22）
-const { usagePath } = await import('../bundle/host/index-v5.mjs')
+const { usagePath, runtimePath } = await import('../bundle/host/index-v5.mjs')
+const { writeRuntimeState, readRuntimeState, readConfigDocument } = await import('../bundle/host/config-store.mjs')
 const { writeUsageDocument } = await import('../bundle/host/config-store.mjs')
 const { beijingMonthKey } = await import('../bundle/host/core.mjs')
 const { mapYuanbaoPages } = await import('../bundle/host/index-v5.mjs')
@@ -238,7 +239,7 @@ function yuanbaoOk(items, extra = {}) {
 	)
 }
 const yuanbaoSource = (overrides = {}) => ({ id: 's1', kind: 'yuanbao', mode: 'env', ref: SECRET_KEY_REF, secretId: SECRET_ID, ...overrides })
-const resetUsage = () => { __resetFallbackRegistryForTests(); writeUsageDocument(usagePath(), { months: {} }) }
+const resetUsage = () => { __resetFallbackRegistryForTests(); writeUsageDocument(usagePath(), { months: {} }); writeRuntimeState(runtimePath(), { sources: {} }) }
 
 await test('yuanbao 腿：签名头/请求体/结果映射都成立', async () => {
 	const credentials = makeFakeCredentials({ values: { [SECRET_KEY_REF]: 'sk-test' } })
@@ -460,6 +461,85 @@ await test('deepseek-api 腿：HTTP 429 ⇒ RATE_LIMIT，带出 error.message；
 		const result = await provider.search({ query: 'q' }, undefined)
 		assert.equal(call, 2)
 		assert.deepEqual(result.sources.map((source) => source.url), ['https://served-by-s2'])
+	} finally {
+		stubFetch(realFetch)
+	}
+})
+//#endregion
+
+//#region 停用：手动（配置里）与自动（运行时状态）——都是 disable，不是 delete
+await test('手动停用（disabled）的源被跳过：不解析凭据、不发请求，但源还在配置里', async () => {
+	const credentials = makeFakeCredentials({ values: { K1: 'k1', K2: 'k2' } })
+	const { provider } = mountChain({ credentials })
+	resetUsage()
+	setDoc([
+		{ id: 's1', kind: 'tavily', mode: 'env', ref: 'K1', disabled: true },
+		{ id: 's2', kind: 'tavily', mode: 'env', ref: 'K2' },
+	])
+	const seen = []
+	stubFetch(async (url, init) => {
+		seen.push(init.headers.authorization)
+		return tavilyOk(['https://served-by-s2'])
+	})
+	try {
+		const result = await provider.search({ query: 'q' }, undefined)
+		assert.deepEqual(seen, ['Bearer k2'], '停用的源一个请求都不该发')
+		assert.deepEqual(result.sources.map((source) => source.url), ['https://served-by-s2'])
+		assert.equal(readConfigDocument(configPath()).doc.sources.length, 2, '停用不等于删除')
+		assert.ok(credentials.calls.resolve.includes('K2'))
+		assert.equal(credentials.calls.resolve.includes('K1'), false, '停用的源连凭据都不该解析')
+	} finally {
+		stubFetch(realFetch)
+	}
+})
+
+await test('★自动停用：连续 3 次确定性失败（432）后摘掉该腿，之后再搜一次请求都不发（源仍保留）', async () => {
+	const credentials = makeFakeCredentials({ values: { K1: 'k1' } })
+	const { provider } = mountChain({ credentials })
+	resetUsage()
+	setDoc([{ id: 's1', kind: 'tavily', mode: 'env', ref: 'K1' }])
+	let calls = 0
+	stubFetch(async () => {
+		calls += 1
+		return tavilyFail(432, 'plan limit')
+	})
+	try {
+		for (let round = 0; round < 3; round += 1) {
+			await assert.rejects(() => provider.search({ query: 'q' }, undefined))
+		}
+		assert.equal(calls, 3)
+		const state = readRuntimeState(runtimePath()).state
+		assert.equal(state.sources.s1?.fails, 3)
+		assert.ok(typeof state.sources.s1?.autoDisabledAt === 'string', JSON.stringify(state))
+		await assert.rejects(() => provider.search({ query: 'q' }, undefined))
+		assert.equal(calls, 3, '自动停用后不许再发请求')
+		assert.equal(readConfigDocument(configPath()).doc.sources.length, 1, '自动停用也不删源')
+		const log = readFileSync(`${dir}\\web-search-chain.log`, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+		assert.ok(log.some((entry) => entry.outcome === 'auto-disabled' && entry.slot === 's1'), '自动停用要留审计')
+	} finally {
+		stubFetch(realFetch)
+	}
+})
+
+await test('暂时性失败（429 / 超时）不累计自动停用；成功一次清零计数', async () => {
+	const credentials = makeFakeCredentials({ values: { K1: 'k1' } })
+	const { provider } = mountChain({ credentials })
+	resetUsage()
+	setDoc([{ id: 's1', kind: 'tavily', mode: 'env', ref: 'K1' }])
+	let round = 0
+	stubFetch(async () => {
+		round += 1
+		if (round <= 2) return tavilyFail(429, 'rate limited')
+		if (round === 3) return tavilyFail(500, 'boom')
+		return tavilyOk(['https://ok'])
+	})
+	try {
+		for (let i = 0; i < 3; i += 1) await assert.rejects(() => provider.search({ query: 'q' }, undefined))
+		const state = readRuntimeState(runtimePath()).state
+		assert.equal(state.sources.s1, undefined, '429/5xx 不许累计')
+		const result = await provider.search({ query: 'q' }, undefined)
+		assert.deepEqual(result.sources.map((source) => source.url), ['https://ok'])
+		assert.equal(readRuntimeState(runtimePath()).state.sources.s1, undefined)
 	} finally {
 		stubFetch(realFetch)
 	}

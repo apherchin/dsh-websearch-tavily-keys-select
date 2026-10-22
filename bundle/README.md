@@ -84,6 +84,8 @@ dsh plugin --profile <你的 profile> add dsh-websearch-tavily-keys-select
 
 - **源的顺序 = 尝试顺序**；最多 **4 个**源；每个源失败自动降级到下一个。
 - **官方兜底**：页面里 `DS_OFFICIAL` 那个开关。本机 2026-10-22 起**已关掉**（改用 DS 搜索 API 兜底）——关掉就不花官方余额。
+- **停用（disable，不是删除）**：每个源行首有「启用」勾选框，取消勾选 ⇒ 该源**留在配置里**但不再参与搜索（密钥、顺序、额度设置都保留，随时可勾回来）。
+- **自动停用**：某源**连续 3 次确定性失败**（鉴权失败 / 套餐超限 / 404 这类"不修就一直失败"的错误）后，宿主自动把它摘出链路，卡片上显示原因与「恢复」按钮；超时、429、5xx 属于暂时性失败，**不累计**。
 - 保存后**立即生效**（下一次搜索就用新配置），无需重启。
 - 环境变量是 DSH **启动时**快照的：新加/改完 `TENCENTCLOUD_SECRET_KEY` 要**重启 DSH** 才生效。
 
@@ -93,6 +95,7 @@ dsh plugin --profile <你的 profile> add dsh-websearch-tavily-keys-select
 |---|---|
 | `$DSH_HOME\web-search-chain.json` | **源列表（唯一真源）**，每次搜索重读；损坏或超 64 KB 时按默认值工作 |
 | `$DSH_HOME\web-search-chain-usage.json` | **本地额度账本**（按北京时间 `YYYY-MM` 分桶）；坏了按 0 计（保留余量兜底） |
+| `$DSH_HOME\web-search-chain-state.json` | **运行时状态**：连续失败计数 + 自动停用标记；与配置分开存，删掉它就等于"全部恢复"（源本身一个都不少） |
 | `$DSH_HOME\.credentials.yaml` | **明文密钥**进 DSH 凭据域（`refs` 段，引用名 `WEB_SEARCH_TAVILY_<n>`） |
 | `$DSH_HOME\web-search-chain.log` | **审计日志**：哪条源服务了、何时走了官方兜底、何时因额度被跳过 |
 
@@ -107,9 +110,9 @@ dsh plugin --profile <你的 profile> add dsh-websearch-tavily-keys-select
 ### 测试（离线，任意 cwd）
 
 ```powershell
-node test\run-all.mjs         # 9 个测试文件 / 146 条（含 manifest 11、route 30、core-budget 14、tencent-sign 9）
-node test\verify-client.mjs   # 客户端验证台：71/71（含合规守卫、注册 key 动态比对）
-node test\make-mutants.mjs    # 变异测试：10/10 必须被杀（含"拆掉额度闸门""月份键改 UTC""签名不做小写"）
+node test\run-all.mjs         # 9 个测试文件 / 153 条（含 manifest 11、route 33、core-budget 14、tencent-sign 9）
+node test\verify-client.mjs   # 客户端验证台：76/76（含合规守卫、注册 key 动态比对）
+node test\make-mutants.mjs    # 变异测试：11/11 必须被杀（含"拆掉额度闸门""月份键改 UTC""签名不做小写""停用的源照样被搜"）
 ```
 
 > ⚠️ 别用 `node --test`：本机沙箱禁命名管道，runner 会 spawn EPERM 并给出误导性的 `# fail 1`。

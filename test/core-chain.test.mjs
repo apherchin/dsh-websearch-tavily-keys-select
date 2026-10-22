@@ -1,5 +1,16 @@
 import { test, summary, assert } from './harness.mjs'
-import { orderedLegs, unusedRefs, describeAttempts, LITERAL_REF_PREFIX } from '../bundle/host/core.mjs'
+import {
+	orderedLegs,
+	unusedRefs,
+	describeAttempts,
+	LITERAL_REF_PREFIX,
+	selectableSources,
+	recordFailure,
+	recordSuccess,
+	clearAutoDisable,
+	autoDisabledOf,
+	AUTO_DISABLE_THRESHOLD,
+} from '../bundle/host/core.mjs'
 
 console.log('-- core: 腿序 / 凭据回收 / 失败文案 --')
 
@@ -68,4 +79,42 @@ await test('LITERAL_REF_PREFIX 就是本插件明文 ref 的命名空间', () =>
 	assert.equal(LITERAL_REF_PREFIX, 'WEB_SEARCH_TAVILY_')
 })
 
+//#region 停用（disable，不是 delete）
+await test('selectableSources：手动停用与自动停用都被跳过，其余保持文档顺序', () => {
+	const sources = [
+		{ id: 's1', kind: 'tavily', mode: 'env', ref: 'A' },
+		{ id: 's2', kind: 'tavily', mode: 'env', ref: 'B', disabled: true },
+		{ id: 's3', kind: 'tavily', mode: 'env', ref: 'C' },
+	]
+	const runtime = { sources: { s3: { fails: 3, autoDisabledAt: '2026-10-22T05:00:00.000Z', reason: 'HTTP 432' } } }
+	assert.deepEqual(selectableSources(sources, runtime).map((source) => source.id), ['s1'])
+	assert.deepEqual(selectableSources(sources, undefined).map((source) => source.id), ['s1', 's3'])
+})
+
+await test(`recordFailure：连到第 ${AUTO_DISABLE_THRESHOLD} 次才自动停用（并记原因/时间）；recordSuccess 清零`, () => {
+	let state = { sources: {} }
+	for (let round = 1; round < AUTO_DISABLE_THRESHOLD; round += 1) {
+		state = recordFailure(state, 's1', 'HTTP 432', 1000)
+		assert.equal(autoDisabledOf(state, 's1'), undefined, `第 ${round} 次不该停用`)
+		assert.equal(state.sources.s1.fails, round)
+	}
+	state = recordFailure(state, 's1', 'HTTP 432', 2000)
+	assert.deepEqual(autoDisabledOf(state, 's1'), { at: '1970-01-01T00:00:02.000Z', reason: 'HTTP 432' })
+	// 再失败不会把停用时间刷新
+	state = recordFailure(state, 's1', 'again', 3000)
+	assert.equal(autoDisabledOf(state, 's1').at, '1970-01-01T00:00:02.000Z')
+	const cleared = recordSuccess(state, 's1')
+	assert.equal(cleared.sources.s1.autoDisabledAt, '1970-01-01T00:00:02.000Z', '成功不清停用标记')
+	assert.equal(cleared.sources.s1.fails, 0)
+})
+
+await test('clearAutoDisable：清掉标记（源与失败计数一起清），不碰别的源', () => {
+	const state = { sources: { s1: { fails: 3, autoDisabledAt: '2026-10-22T05:00:00.000Z', reason: 'HTTP 432' }, s2: { fails: 1 } } }
+	const next = clearAutoDisable(state, 's1')
+	assert.equal(next.sources.s1, undefined)
+	assert.equal(next.sources.s2.fails, 1)
+	// 幂等
+	assert.equal(clearAutoDisable(next, 's1'), next)
+})
+//#endregion
 summary('core-chain')

@@ -91,8 +91,8 @@ await test('GET：文件不存在时给默认文档 + 默认凭据状态 + 模�
 		// 界面因此只能按 `configured` / `writable` 分支（不去读 source）—— 与 spec §7 一致。
 		// 同一条教训在本仓库 session-delete 上踩过：attached=undefined 时该键在 JSON 里消失。
 		// 默认文档 = 两条 Tavily（key1 → key2，2026-09-29 用户选定）。
-		{ id: 's1', kind: 'tavily', mode: 'env', ref: 'TAVILY_API_KEY1', budget: null, credential: { configured: false, writable: true }, usage: unlimitedUsage },
-		{ id: 's2', kind: 'tavily', mode: 'env', ref: 'TAVILY_API_KEY2', budget: null, credential: { configured: false, writable: true }, usage: unlimitedUsage },
+		{ id: 's1', kind: 'tavily', mode: 'env', ref: 'TAVILY_API_KEY1', budget: null, credential: { configured: false, writable: true }, usage: unlimitedUsage, disabled: false, autoDisabled: null },
+		{ id: 's2', kind: 'tavily', mode: 'env', ref: 'TAVILY_API_KEY2', budget: null, credential: { configured: false, writable: true }, usage: unlimitedUsage, disabled: false, autoDisabled: null },
 	])
 	assert.deepEqual(body.defaults, {
 		budgets: {
@@ -104,6 +104,7 @@ await test('GET：文件不存在时给默认文档 + 默认凭据状态 + 模�
 	assert.deepEqual(body.fallback, { kind: 'deepseek', enabled: false })
 	assert.equal(body.configError, null)
 	assert.equal(body.usageError, null)
+	assert.equal(body.stateError, null)
 })
 
 await test('GET：文档损坏时照常 200，并用 configError 告知界面', async () => {
@@ -180,7 +181,7 @@ await test('POST 合法 env 提交 ⇒ 200、文档落盘、返回 applied', asy
 	const { status, body } = await readResponse(await post({ sources: [{ id: 's1', kind: 'tavily', mode: 'env', ref: 'TAVILY_API_KEY9' }] }, ctx))
 	assert.equal(status, 200)
 	assert.equal(body.ok, true)
-	assert.deepEqual(body.applied, { setRefs: [], unsetRefs: [], warnings: [], usage: {} })
+	assert.deepEqual(body.applied, { setRefs: [], unsetRefs: [], warnings: [], usage: {}, restoredAuto: {} })
 	assert.deepEqual(readConfigDocument(configPath()).doc.sources, [{ id: 's1', kind: 'tavily', mode: 'env', ref: 'TAVILY_API_KEY9' }])
 	assert.equal(body.sources[0].ref, 'TAVILY_API_KEY9')
 })
@@ -342,6 +343,43 @@ await test('GET：用量文件损坏时照常 200，并给出 usageError（界�
 	assert.equal(status, 200)
 	assert.ok(typeof body.usageError === 'string' && body.usageError.includes('用量文件损坏'), body.usageError)
 	assert.equal(body.sources[0].usage.used, 0)
+})
+//#region 停用（disable，不是 delete）与自动停用
+await test('POST：手动停用写进文档（源还在，只是 disabled: true），GET 如实返回', async () => {
+	const ctx = makeFakeCtx({ credentials: makeFakeCredentials(), connection: makeFakeConnection() })
+	const disabled = { ...YUANBAO_SUBMISSION, disabled: true }
+	const { status, body } = await readResponse(await post({ sources: [disabled] }, ctx))
+	assert.equal(status, 200)
+	assert.equal(readConfigDocument(configPath()).doc.sources[0].disabled, true, '停用必须落盘（不是删除）')
+	assert.equal(readConfigDocument(configPath()).doc.sources.length, 1)
+	assert.equal(body.sources[0].disabled, true)
+	assert.equal(body.sources[0].secretId, YUANBAO_SUBMISSION.secretId, '停用不丢字段')
+})
+
+await test('GET：自动停用状态来自运行时状态文件（与手动 disabled 分开）', async () => {
+	const { writeRuntimeState } = await import('../bundle/host/config-store.mjs')
+	const { runtimePath } = await import('../bundle/host/index-v5.mjs')
+	const ctx = makeFakeCtx({ credentials: makeFakeCredentials(), connection: makeFakeConnection() })
+	await readResponse(await post({ sources: [YUANBAO_SUBMISSION] }, ctx))
+	writeRuntimeState(runtimePath(), { sources: { s1: { fails: 3, autoDisabledAt: '2026-10-22T05:00:00.000Z', reason: 'HTTP 432' } } })
+	const { body } = await readResponse(await get(ctx))
+	assert.equal(body.sources[0].disabled, false)
+	assert.deepEqual(body.sources[0].autoDisabled, { at: '2026-10-22T05:00:00.000Z', reason: 'HTTP 432' })
+})
+
+await test('POST resetAutoDisabled：清掉自动停用标记（源仍在），并在 applied 里回报', async () => {
+	const { writeRuntimeState, readRuntimeState } = await import('../bundle/host/config-store.mjs')
+	const { runtimePath } = await import('../bundle/host/index-v5.mjs')
+	const ctx = makeFakeCtx({ credentials: makeFakeCredentials(), connection: makeFakeConnection() })
+	await readResponse(await post({ sources: [YUANBAO_SUBMISSION] }, ctx))
+	writeRuntimeState(runtimePath(), { sources: { s1: { fails: 3, autoDisabledAt: '2026-10-22T05:00:00.000Z', reason: 'HTTP 432' }, s9: { fails: 9 } } })
+	const { status, body } = await readResponse(await post({ sources: [YUANBAO_SUBMISSION], resetAutoDisabled: ['s1', 's9', 'nope'] }, ctx))
+	assert.equal(status, 200)
+	assert.deepEqual(body.applied.restoredAuto, { s1: { at: '2026-10-22T05:00:00.000Z', reason: 'HTTP 432' } }, '只恢复真实存在且属于这份配置的 id')
+	assert.equal(body.sources[0].autoDisabled, null)
+	const state = readRuntimeState(runtimePath()).state
+	assert.equal(state.sources.s1, undefined)
+	assert.ok(state.sources.s9 !== undefined, '不在这份配置里的 id 不许被清（防误伤）')
 })
 //#endregion
 

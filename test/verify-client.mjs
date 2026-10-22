@@ -384,8 +384,8 @@ face.hooks.webSearchChain.set({ status: 'ready', error: null, state: SERVER_STAT
 	const passwords = findAll(tree, (el) => el.type === 'input' && el.props?.type === 'password')
 	const inputs = findAll(tree, (el) => el.type === 'input')
 	const numbers = findAll(tree, (el) => el.type === 'input' && el.props?.type === 'number')
-	check('渲染：每个源一对 checkbox（2 源 = 4 个）', checkboxes.length === 4, String(checkboxes.length))
-	check('渲染：每个源恰好勾中一个（互斥）', checked.length === 2, String(checked.length))
+	check('渲染：每个源三个 checkbox（启用 + 环境变量 + 明文）⇒ 2 源 = 6 个', checkboxes.length === 6, String(checkboxes.length))
+	check('渲染：每个源「启用」恒勾中 + 两个模式 checkbox 恰好勾中一个（2 源 = 4 个勾中）', checked.length === 4, String(checked.length))
 	check('渲染：literal 源有密码输入框（1 个）', passwords.length === 1, String(passwords.length))
 	check('渲染：env 源的变量名输入框显示 ref', inputs.some((el) => el.props.value === 'TENCENTCLOUD_SECRET_KEY'))
 	check('渲染：yuanbao 源显示 SecretId（可改，明文）', inputs.some((el) => el.props.value === 'AKIDtestSecretId0000000000000000'))
@@ -404,6 +404,32 @@ face.hooks.webSearchChain.set({ status: 'ready', error: null, state: SERVER_STAT
 	const tree = expandAll(reg.Comp(propsFor('page')))
 	const buttons = findAll(tree, (el) => el.type === 'button')
 	check('渲染：到上限时「添加」按钮置灰', buttons.some((el) => el.props.disabled === true && String(el.props.children).includes('上限')))
+}
+{
+	// 停用/自动停用：都是 disable（不是 delete）
+	const disabledState = {
+		...SERVER_STATE,
+		sources: [
+			{ ...SERVER_STATE.sources[0], disabled: true },
+			{ ...SERVER_STATE.sources[1], autoDisabled: { at: '2026-10-22T05:00:00.000Z', reason: 'HTTP 432' } },
+		],
+	}
+	face.hooks.webSearchChain.set({ status: 'ready', error: null, state: disabledState, draft: I.draftFromState(disabledState), saving: false, notice: null })
+	const tree = expandAll(reg.Comp(propsFor('page')))
+	const text = JSON.stringify(tree)
+	check('渲染：手动停用的源显示「已停用」提示，源仍在（2 个）', text.includes('已停用') && disabledState.sources.length === 2 && I.draftFromState(disabledState).sources.length === 2)
+	check('渲染：自动停用的源显示原因 + 「恢复」按钮', text.includes('已自动停用') && text.includes('HTTP 432') && text.includes('恢复'))
+}
+{
+	// 纯逻辑：勾选/恢复 + 请求体
+	const draft = I.draftFromState(SERVER_STATE)
+	const off = I.toggleDisabled(draft, 0, false)
+	const on = I.toggleDisabled(off, 0, true)
+	check('toggleDisabled：取消勾选 = 停用（disabled:true），再勾选回来 = 启用', off.sources[0].disabled === true && on.sources[0].disabled === false && on.sources[0].ref === draft.sources[0].ref)
+	const req = I.toRequest(off)
+	check('toRequest：停用的源带 disabled:true，启用的源**不带**这个字段', req.sources[0].disabled === true && req.sources[1].disabled === undefined)
+	const auto = I.draftFromState({ ...SERVER_STATE, sources: [{ ...SERVER_STATE.sources[0], autoDisabled: { at: 'x', reason: 'HTTP 432' } }] })
+	check('restoreIdsOf：只收「点了恢复」且确实处于自动停用的源', I.restoreIdsOf(auto).length === 0 && I.restoreIdsOf(I.markRestoreAuto(auto, 0)).length === 1 && I.restoreIdsOf(I.markRestoreAuto(auto, 0))[0] === auto.sources[0].id)
 }
 {
 	// 有问题：保存键必须置灰

@@ -90,6 +90,11 @@ window.__ModuleLoader__.load({
 				usageReserve: (reserve) => ` · 其中 ${reserve} 次作为余量不使用`,
 				usagePromo: (monthly, until) => ` · 活动额度 ${monthly} 次（至 ${until}，到期自动降回日常额度）`,
 				usageExhausted: "额度已用完，这条源会被跳过（不会超额计费）",
+				enabled: "启用",
+				disabledTag: "已停用（不参与搜索，配置保留）",
+				autoDisabledTag: (reason) => `已自动停用（连续失败）：${reason}`,
+				restore: "恢复",
+				restorePending: "保存后恢复",
 			},
 			en: {
 				title: "Web search chain",
@@ -141,6 +146,11 @@ window.__ModuleLoader__.load({
 				usageReserve: (reserve) => ` · ${reserve} calls held back as a reserve`,
 				usagePromo: (monthly, until) => ` · promotion quota ${monthly} calls (until ${until}, then back to the regular quota)`,
 				usageExhausted: "Quota exhausted — this source is skipped (no overage billing)",
+				enabled: "Enabled",
+				disabledTag: "disabled (kept, not searched)",
+				autoDisabledTag: (reason) => `auto-disabled after repeated failures: ${reason}`,
+				restore: "Restore",
+				restorePending: "restored on save",
 			},
 		};
 		const copy = typeof navigator !== "undefined" && /^en\b/i.test(String(navigator.language ?? "")) ? COPY.en : COPY.zh;
@@ -229,6 +239,10 @@ window.__ModuleLoader__.load({
 					usage,
 					used: String(used),
 					serverUsed: used,
+					// 停用（不是删除）：disabled = 用户手动；autoDisabled = 宿主连续失败后自动摘掉
+					disabled: source.disabled === true,
+					autoDisabled: source.autoDisabled ?? null,
+					restoreAuto: false,
 				};
 			});
 			return { sources };
@@ -262,6 +276,17 @@ window.__ModuleLoader__.load({
 		/** 改「本月已用」（校准用，不是本地计数器本身）。 */
 		function setUsed(draft, index, used) {
 			return patchSource(draft, index, { used });
+		}
+		/**
+		 * 勾选/取消「启用」：**停用不是删除** —— 源、密钥、顺序都原样保留，只是不参与搜索。
+		 * 取消勾选（disabled=true）后 `toRequest` 会带 `disabled: true`。
+		 */
+		function toggleDisabled(draft, index, enabled) {
+			return patchSource(draft, index, { disabled: enabled !== true });
+		}
+		/** 对自动停用的源点「恢复」：只在草稿上打标记，保存时发 `resetAutoDisabled`。 */
+		function markRestoreAuto(draft, index) {
+			return patchSource(draft, index, { restoreAuto: true });
 		}
 		function removeSource(draft, index) {
 			return { sources: draft.sources.filter((_, at) => at !== index) };
@@ -306,6 +331,9 @@ window.__ModuleLoader__.load({
 						usage: null,
 						used: "0",
 						serverUsed: 0,
+						disabled: false,
+						autoDisabled: null,
+						restoreAuto: false,
 					},
 				],
 			};
@@ -337,9 +365,21 @@ window.__ModuleLoader__.load({
 						const budget = budgetOf(source);
 						if (budget !== null) row.budget = budget;
 					}
+					// 手动停用：写进文档（源仍保留）；取消勾选就**不带**这个字段
+					if (source.disabled === true) row.disabled = true;
 					return row;
 				}),
 			};
+		}
+		/**
+		 * 用户在界面上点了「恢复」的源 id（清自动停用标记用）。
+		 * 只对**当前确实被自动停用**的源生效，避免把脏标记发上去。
+		 */
+		function restoreIdsOf(draft) {
+			return (draft?.sources ?? [])
+				.filter((source) => source.restoreAuto === true && source.autoDisabled !== null && source.autoDisabled !== undefined)
+				.map((source) => source.id)
+				.filter((id) => typeof id === "string" && id.length > 0);
 		}
 		/**
 		 * 需要校准的「本月已用」：只带**用户改过的**那些（否则每次保存都会把本地计数器
@@ -457,6 +497,13 @@ window.__ModuleLoader__.load({
 						break;
 					case "used":
 						shell.draft = setUsed(current, action.index, action.value);
+						break;
+					case "toggleDisabled":
+						// action.value = 勾选后的「启用」状态
+						shell.draft = toggleDisabled(current, action.index, action.value);
+						break;
+					case "restoreAuto":
+						shell.draft = markRestoreAuto(current, action.index);
 						break;
 					case "remove":
 						shell.draft = removeSource(current, action.index);
@@ -627,18 +674,43 @@ window.__ModuleLoader__.load({
 			const title = `${copy.source(index + 1)} · ${copy.template}: ${template?.label ?? kind}`;
 			const isEnv = source.mode === "env";
 			const storedRef = source.serverMode === "literal" && typeof source.ref === "string" && source.ref.length > 0;
+			const autoDisabled = source.autoDisabled ?? null;
+			// 自动停用的行：草稿里点了「恢复」就显示待保存态，否则给「恢复」按钮
+			const restorePending = source.restoreAuto === true;
 			return jsxs(
 				"div",
 				{
-					style: S.row,
+					style: source.disabled === true ? { ...S.row, opacity: 0.6 } : S.row,
 					children: [
 						jsxs("div", {
 							style: S.rowHead,
 							children: [
+								// 「启用」勾选框：取消勾选 = **停用**（源不删，配置与密钥都保留）
+								jsx(AtomCheckbox, {
+									checked: source.disabled !== true,
+									label: copy.enabled,
+									onChange: (value) => props.edit({ kind: "toggleDisabled", index, value }),
+								}),
 								jsx("span", { style: S.rowTitle, children: title }),
 								jsx(AtomButton, { children: copy.remove, onClick: () => props.edit({ kind: "remove", index }) }),
 							],
 						}),
+						source.disabled === true ? jsx("p", { style: S.hint, children: copy.disabledTag }, `disabled-${index}`) : null,
+						autoDisabled !== null
+							? jsxs(
+									"div",
+									{
+										style: S.field,
+										children: [
+											jsx("span", { children: copy.autoDisabledTag(autoDisabled.reason ?? "") }),
+											restorePending
+												? jsx("span", { style: S.hint, children: copy.restorePending })
+												: jsx(AtomButton, { children: copy.restore, onClick: () => props.edit({ kind: "restoreAuto", index }) }),
+										],
+									},
+									`auto-${index}`,
+								)
+							: null,
 						...(kind === "yuanbao" ? renderYuanbaoExtras(source, index, props) : []),
 						jsx(AtomCheckbox, {
 							checked: isEnv,
@@ -810,7 +882,7 @@ window.__ModuleLoader__.load({
 				response = await fetch(CONFIG_PATH, {
 					method: "POST",
 					headers: { "content-type": "application/json" },
-					body: JSON.stringify({ ...toRequest(snapshot.draft), usage: usagePatchOf(snapshot.state, snapshot.draft) }),
+					body: JSON.stringify({ ...toRequest(snapshot.draft), usage: usagePatchOf(snapshot.state, snapshot.draft), resetAutoDisabled: restoreIdsOf(snapshot.draft) }),
 				});
 				payload = await response.json().catch(() => void 0);
 			} catch (error) {
@@ -900,6 +972,9 @@ window.__ModuleLoader__.load({
 			setSecretId,
 			setBudget,
 			setUsed,
+			toggleDisabled,
+			markRestoreAuto,
+			restoreIdsOf,
 			removeSource,
 			addSource,
 			maxSourcesOf,

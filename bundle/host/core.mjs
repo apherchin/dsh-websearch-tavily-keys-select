@@ -346,6 +346,13 @@ export function parseDocumentText(text) {
 			}
 			source.budget = budget
 		}
+		if (raw.disabled !== undefined) {
+			// 手动停用：**用户的意图**，与运行时观察到的"自动停用"分开存（见 config-store 的 runtime state）
+			if (typeof raw.disabled !== 'boolean') {
+				return { doc: defaultDocument(), error: `configuration.sources[${index}].disabled must be a boolean` }
+			}
+			if (raw.disabled) source.disabled = true
+		}
 		sources.push(source)
 	}
 	const ids = new Set()
@@ -365,6 +372,7 @@ export function serializeDocument(doc) {
 		const row = { id: source.id, kind: source.kind, mode: source.mode, ref: source.ref }
 		if (source.kind === 'yuanbao' && typeof source.secretId === 'string') row.secretId = source.secretId
 		if (source.budget !== undefined) row.budget = source.budget
+		if (source.disabled === true) row.disabled = true
 		return row
 	})
 	return `${JSON.stringify({ version: DOCUMENT_VERSION, sources }, null, 2)}\n`
@@ -457,6 +465,11 @@ export function validateSubmission(body, previousDoc) {
 			}
 			row.budget = budget
 		}
+		if (raw.disabled !== undefined) {
+			// 手动停用（**不是删除**）：源留在文档里、不参与搜索，随时可以再启用
+			if (typeof raw.disabled !== 'boolean') return failure('INVALID_CONFIG', 'disabled 必须是布尔值', at('disabled'))
+			if (raw.disabled) row.disabled = true
+		}
 
 		if (raw.mode === 'env') {
 			const ref = typeof raw.ref === 'string' ? raw.ref.trim() : ''
@@ -502,6 +515,116 @@ export function orderedLegs(sources, fallback) {
 	if (fallback !== undefined) legs.push({ kind: 'deepseek', id: fallback.slot, ref: fallback.keyRef })
 	return legs
 }
+
+//#region 运行时状态：失败计数与「自动停用」（**不是删除**）
+/** 运行时状态版本。 */
+export const RUNTIME_VERSION = 1
+/** 连续多少次「确定性失败」后自动停用一条源。 */
+export const AUTO_DISABLE_THRESHOLD = 3
+
+/**
+ * 空运行时状态。
+ *
+ * 与配置文档分开存的两个理由：
+ * 1. **不伪造用户意图**：自动停用是"观察到的现象"，用户从未说过要停用；写进配置会让界面误以为是他按的；
+ * 2. 搜索路径因此**不必写配置文档**（那是用户的东西），只碰自己的状态文件。
+ */
+export function emptyRuntimeState() {
+	return { version: RUNTIME_VERSION, sources: {} }
+}
+
+/**
+ * 解析运行时状态。坏数据一律降级成空（搜索不能因为这个文件挂掉）。
+ * @param text - 文件内容。
+ */
+export function parseRuntimeStateText(text) {
+	if (typeof text !== 'string') return { state: emptyRuntimeState(), error: 'runtime state is not text' }
+	let parsed
+	try {
+		parsed = JSON.parse(text)
+	} catch (error) {
+		return { state: emptyRuntimeState(), error: `runtime state is not valid JSON: ${String(error)}` }
+	}
+	if (!isPlainObject(parsed) || !isPlainObject(parsed.sources)) {
+		return { state: emptyRuntimeState(), error: 'runtime state must be an object with a sources object' }
+	}
+	const sources = {}
+	for (const [id, entry] of Object.entries(parsed.sources)) {
+		if (!ID_PATTERN.test(id) || !isPlainObject(entry)) continue
+		const clean = {}
+		if (Number.isInteger(entry.fails) && entry.fails > 0) clean.fails = entry.fails
+		if (typeof entry.autoDisabledAt === 'string') clean.autoDisabledAt = entry.autoDisabledAt
+		if (typeof entry.reason === 'string') clean.reason = entry.reason.slice(0, 200)
+		if (Object.keys(clean).length > 0) sources[id] = clean
+	}
+	return { state: { version: RUNTIME_VERSION, sources }, error: undefined }
+}
+
+/** 序列化运行时状态（稳定 2 空格缩进 + 末尾换行）。 */
+export function serializeRuntimeState(state) {
+	return `${JSON.stringify({ version: RUNTIME_VERSION, sources: state.sources }, null, 2)}\n`
+}
+
+/** 某源是否被自动停用；是则返回 `{at, reason}`。 */
+export function autoDisabledOf(state, id) {
+	const entry = state?.sources?.[id]
+	return typeof entry?.autoDisabledAt === 'string' ? { at: entry.autoDisabledAt, reason: entry.reason ?? '' } : undefined
+}
+
+/**
+ * 参与搜索的源：**手动停用**（文档里的 `disabled`）与**自动停用**（运行时状态）都不参与。
+ * 顺序保持文档顺序 —— 停用只是"跳过"，不是删除，重新启用后回到原位。
+ * @param sources - 文档里的源（有序）。
+ * @param runtime - 运行时状态（可缺省 = 没有自动停用）。
+ */
+export function selectableSources(sources, runtime) {
+	return sources.filter((source) => source.disabled !== true && autoDisabledOf(runtime, source.id) === undefined)
+}
+
+/**
+ * 记一次失败：连续 `AUTO_DISABLE_THRESHOLD` 次「确定性失败」⇒ 打上 `autoDisabledAt`。
+ *
+ * 只给**确定性失败**（鉴权失败、套餐超限、404 之类）调用：超时/429/5xx 属于暂时性，
+ * 记进去会让"网络抖一下"就把源永久摘掉。
+ *
+ * @param state - 当前运行时状态。
+ * @param id - 源 id。
+ * @param reason - 失败原因（截断 200 字）。
+ * @param nowMs - 毫秒时间戳（测试注入）。
+ */
+export function recordFailure(state, id, reason, nowMs = Date.now()) {
+	const entry = state?.sources?.[id] ?? {}
+	const fails = (Number.isInteger(entry.fails) ? entry.fails : 0) + 1
+	const next = { ...entry, fails }
+	if (fails >= AUTO_DISABLE_THRESHOLD && typeof entry.autoDisabledAt !== 'string') {
+		next.autoDisabledAt = new Date(nowMs).toISOString()
+		next.reason = String(reason ?? '').slice(0, 200)
+	}
+	return { version: RUNTIME_VERSION, sources: { ...state.sources, [id]: next } }
+}
+
+/** 记一次成功：把失败计数清零（自动停用的标记不该被普通成功清掉——停用的源根本不会跑）。 */
+export function recordSuccess(state, id) {
+	const entry = state?.sources?.[id]
+	if (entry === undefined || (entry.fails === undefined && entry.autoDisabledAt === undefined)) return state
+	const next = { ...state.sources }
+	if (typeof entry.autoDisabledAt === 'string') {
+		// 理论上不会发生（停用的源不参与搜索）；保守地保留停用标记，只清计数
+		next[id] = { ...entry, fails: 0 }
+	} else {
+		delete next[id]
+	}
+	return { version: RUNTIME_VERSION, sources: next }
+}
+
+/** 用户点了「恢复」：清掉该源的自动停用标记与失败计数。 */
+export function clearAutoDisable(state, id) {
+	if (state?.sources?.[id] === undefined) return state
+	const next = { ...state.sources }
+	delete next[id]
+	return { version: RUNTIME_VERSION, sources: next }
+}
+//#endregion
 
 /**
  * 这次保存之后应当删除的凭据引用。

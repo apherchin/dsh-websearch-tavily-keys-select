@@ -42,6 +42,21 @@ await test('空文档与默认文档语义不同（「删空」必须与「没�
 	assert.notDeepEqual(emptyDocument(), defaultDocument())
 })
 
+await test('disabled：手动停用能往返（只在 true 时写这个字段），不是删除', () => {
+	const doc = {
+		version: DOCUMENT_VERSION,
+		sources: [
+			{ id: 's1', kind: 'tavily', mode: 'env', ref: 'K1', disabled: true },
+			{ id: 's2', kind: 'tavily', mode: 'env', ref: 'K2' },
+		],
+	}
+	const text = serializeDocument(doc)
+	assert.ok(text.includes('"disabled": true'), text)
+	assert.equal(parseDocumentText(text).doc.sources[0].disabled, true)
+	assert.equal('disabled' in parseDocumentText(text).doc.sources[1], false, 'false 不落盘')
+	assert.ok(parseDocumentText('{"version":2,"sources":[{"id":"s1","kind":"tavily","mode":"env","ref":"K1","disabled":"yes"}]}').error !== undefined)
+})
+
 await test('序列化 → 解析 往返一致（含 secretId 与完整 budget），且末尾一个换行', () => {
 	const doc = { version: DOCUMENT_VERSION, sources: [YUANBAO, { id: 's2', kind: 'tavily', mode: 'literal', ref: 'WEB_SEARCH_TAVILY_1' }] }
 	const text = serializeDocument(doc)

@@ -96,6 +96,13 @@ const MUTANTS = [
 		replace: 'x-tc-action:${String(action)}',
 		test: 'test/tencent-sign.test.mjs',
 	},
+	{
+		name: 'M11 停用的源照样被搜索（selectableSources 不过滤 disabled / 自动停用）',
+		file: 'bundle/host/core.mjs',
+		find: 'return sources.filter((source) => source.disabled !== true && autoDisabledOf(runtime, source.id) === undefined)',
+		replace: 'return sources.slice()',
+		test: 'test/chain-provider.test.mjs',
+	},
 ]
 
 /** 复制正本（跳过 .tmp），返回副本根目录。 */

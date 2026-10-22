@@ -28,19 +28,34 @@ import {
 	MAX_SOURCES,
 	REF_PATTERN,
 	TEMPLATES,
+	autoDisabledOf,
 	beijingMonthKey,
 	budgetStatus,
+	clearAutoDisable,
 	defaultBudgetFor,
 	defaultDocument,
 	describeAttempts,
 	effectiveBudget,
 	orderedLegs,
+	recordFailure,
+	recordSuccess,
+	selectableSources,
 	unusedRefs,
 	usageCount,
 	validateSubmission,
 	withUsageCount,
 } from './core.mjs'
-import { configDocumentPath, readConfigDocument, readUsageDocument, usageDocumentPath, writeConfigDocument, writeUsageDocument } from './config-store.mjs'
+import {
+	configDocumentPath,
+	readConfigDocument,
+	readRuntimeState,
+	readUsageDocument,
+	runtimeStatePath,
+	usageDocumentPath,
+	writeConfigDocument,
+	writeRuntimeState,
+	writeUsageDocument,
+} from './config-store.mjs'
 import { JSON_CONTENT_TYPE, buildTc3Authorization } from './tencent-sign.mjs'
 
 export const name = 'web-search-chain'
@@ -117,6 +132,11 @@ export function usagePath() {
 	return usageDocumentPath(homeDir())
 }
 
+/** 运行时状态路径（失败计数 + 自动停用标记）。 */
+export function runtimePath() {
+	return runtimeStatePath(homeDir())
+}
+
 /** 审计日志路径。 */
 function auditFile() {
 	return join(homeDir(), 'web-search-chain.log')
@@ -130,11 +150,14 @@ class ChainError extends Error {
 	/**
 	 * @param message - 人类可读的失败文本。
 	 * @param code - 消费者据此路由的稳定码（如 `WEB_PROVIDER_ERROR`）。
-	 * @param options - 标准 `Error` 选项（携带 `cause`）。
+	 * @param options - 标准 `Error` 选项（携带 `cause`）；`options.permanent` 标记「确定性失败」
+	 *   （鉴权错误、套餐超限、404…）——只有这种失败才会累计到自动停用；
+	 *   超时 / 429 / 5xx 属于暂时性，永远不累计。
 	 */
 	constructor(message, code, options) {
 		super(message, options)
 		this.code = code
+		this.permanent = options?.permanent === true
 	}
 }
 
@@ -318,7 +341,8 @@ function yuanbaoError(error) {
 			: code === 'ResourceNotFound' || code === 'ResourceUnavailable'
 				? 'WEB_PROVIDER_UNAVAILABLE'
 				: 'WEB_PROVIDER_ERROR'
-	return new ChainError(`Yuanbao search failed (${code})${message.length > 0 ? `: ${message}` : ''}`, mapped)
+	const permanent = code.startsWith('AuthFailure') || code === 'ResourceNotFound' || code === 'ResourceUnavailable'
+	return new ChainError(`Yuanbao search failed (${code})${message.length > 0 ? `: ${message}` : ''}`, mapped, { permanent })
 }
 
 /** 读 Tavily 的 `{detail:{error}}` 失败体，绝不因为读失败体而失败。 */
@@ -377,7 +401,7 @@ export class ChainSearchProvider {
 	 * @param getConfig - 返回当前归一化链配置的 thunk。
 	 * @param readDocument - 返回 `{doc, error}` 的 thunk（每次调用都重读，无缓存）。
 	 * @param loadFallback - 加载官方 provider 类；测试可注入假的。
-	 * @param runtime - 测试注入点：`{ readUsage, writeUsage, now }`；缺省用真实实现。
+	 * @param runtime - 测试注入点：`{ readUsage, writeUsage, readRuntime, writeRuntime, now }`；缺省用真实实现。
 	 */
 	constructor(ctx, getConfig, readDocument, loadFallback = loadDeepSeekProviderClass, runtime = {}) {
 		this.ctx = ctx
@@ -386,6 +410,8 @@ export class ChainSearchProvider {
 		this.loadFallback = loadFallback
 		this.readUsage = runtime.readUsage ?? (() => readUsageDocument(usagePath()))
 		this.writeUsage = runtime.writeUsage ?? ((doc) => writeUsageDocument(usagePath(), doc))
+		this.readRuntime = runtime.readRuntime ?? (() => readRuntimeState(runtimePath()))
+		this.writeRuntime = runtime.writeRuntime ?? ((state) => writeRuntimeState(runtimePath(), state))
 		this.now = runtime.now ?? (() => Date.now())
 	}
 
@@ -394,10 +420,15 @@ export class ChainSearchProvider {
 		return this.getConfig().id
 	}
 
-	/** 有源、或兜底行已挂载，就还算可用。 */
+	/**
+	 * 有**可用**的源、或兜底行已挂载，就还算可用。
+	 * 手动停用 / 自动停用的源不算 —— 全被停用时 `web_search` 会明确报「没有可用 provider」，
+	 * 而不是每次都跑一遍注定失败的腿。
+	 */
 	available() {
 		const { doc } = this.readDocument()
-		return doc.sources.length > 0 || enabledFallback.size > 0
+		const runtime = this.readRuntime().state
+		return selectableSources(doc.sources, runtime).length > 0 || enabledFallback.size > 0
 	}
 
 	/**
@@ -431,11 +462,52 @@ export class ChainSearchProvider {
 		return next
 	}
 
+	/**
+	 * 记一次**确定性失败**：连续 `AUTO_DISABLE_THRESHOLD` 次 ⇒ 自动停用该源（**不删除**）。
+	 *
+	 * 为什么要自动停用：像 Tavily 的 `HTTP 432（超出套餐）` 这种错误，修好之前每次搜索都会白跑
+	 * 一跳（约 300ms）；而它属于"不修就一直失败"，继续试探没有意义。
+	 * 只统计确定性失败——超时/429/5xx 由调用方过滤（`error.permanent === true` 才进来）。
+	 */
+	noteFailure(config, sourceId, target, message) {
+		try {
+			const before = this.readRuntime().state
+			const wasDisabled = autoDisabledOf(before, sourceId) !== undefined
+			const next = recordFailure(before, sourceId, message, this.now())
+			this.writeRuntime(next)
+			const now = autoDisabledOf(next, sourceId)
+			if (!wasDisabled && now !== undefined) {
+				this.record(config, {
+					outcome: 'auto-disabled',
+					target,
+					slot: sourceId,
+					reason: now.reason,
+					afterConsecutiveFailures: next.sources[sourceId]?.fails,
+				})
+			}
+		} catch {
+			// 状态写不进去不影响本次搜索（下次还会再试，最坏是继续白跑一跳）
+		}
+	}
+
+	/** 一次成功 ⇒ 清零失败计数（自动停用的标记不清，因为停用的源根本不会跑到这里）。 */
+	noteSuccess(sourceId) {
+		try {
+			const before = this.readRuntime().state
+			const next = recordSuccess(before, sourceId)
+			if (next !== before) this.writeRuntime(next)
+		} catch {
+			// 同上
+		}
+	}
+
 	/** 按固定腿序跑一次搜索。 */
 	async search(request, signal) {
 		const config = this.getConfig()
 		const { doc } = this.readDocument()
-		const legs = orderedLegs(doc.sources, [...enabledFallback.values()][0])
+		const runtime = this.readRuntime().state
+		// 手动停用（doc.disabled）与自动停用（runtime）都不进腿序；停用只是跳过，不是删除
+		const legs = orderedLegs(selectableSources(doc.sources, runtime), [...enabledFallback.values()][0])
 		const attempts = []
 		const month = beijingMonthKey(this.now())
 
@@ -492,6 +564,7 @@ export class ChainSearchProvider {
 				const used = this.bumpUsage(leg.id, month)
 				try {
 					const result = await this.searchYuanbao(config, { secretId, secretKey: apiKey }, request, signal)
+					this.noteSuccess(leg.id)
 					this.record(config, {
 						outcome: 'served',
 						target: 'yuanbao',
@@ -508,12 +581,9 @@ export class ChainSearchProvider {
 					return { sources: result.sources, truncated: false }
 				} catch (error) {
 					if (signal?.aborted === true) throw error
-					attempts.push({
-						id: leg.id,
-						ref: leg.ref,
-						outcome: 'failed',
-						message: error instanceof Error ? error.message : String(error),
-					})
+					const message = error instanceof Error ? error.message : String(error)
+					if (error?.permanent === true) this.noteFailure(config, leg.id, 'yuanbao', message)
+					attempts.push({ id: leg.id, ref: leg.ref, outcome: 'failed', message })
 					continue
 				}
 			}
@@ -525,6 +595,7 @@ export class ChainSearchProvider {
 					leg.kind === 'deepseek-api'
 						? await this.searchDeepseekApi(config, apiKey, request, signal)
 						: await this.searchTavily(config, apiKey, request, signal)
+				this.noteSuccess(leg.id)
 				this.record(config, {
 					outcome: 'served',
 					target,
@@ -538,12 +609,9 @@ export class ChainSearchProvider {
 				return { sources: result.sources, truncated: false }
 			} catch (error) {
 				if (signal?.aborted === true) throw error
-				attempts.push({
-					id: leg.id,
-					ref: leg.ref,
-					outcome: 'failed',
-					message: error instanceof Error ? error.message : String(error),
-				})
+				const message = error instanceof Error ? error.message : String(error)
+				if (error?.permanent === true) this.noteFailure(config, leg.id, target, message)
+				attempts.push({ id: leg.id, ref: leg.ref, outcome: 'failed', message })
 			}
 		}
 
@@ -580,6 +648,8 @@ export class ChainSearchProvider {
 				throw new ChainError(
 					`Tavily search failed (HTTP ${response.status})${detail === undefined ? '' : `: ${detail}`}`,
 					response.status === 429 ? 'RATE_LIMIT' : 'WEB_PROVIDER_ERROR',
+					// 432 = 超出套餐（Tavily 特有）；401/403/404 也都是"不修就一直失败"
+					{ permanent: [401, 403, 404, 432].includes(response.status) },
 				)
 			}
 			const payload = await response.json()
@@ -634,7 +704,9 @@ export class ChainSearchProvider {
 			}
 			if (!response.ok) {
 				const detail = typeof payload?.error?.message === 'string' ? payload.error.message : text.slice(0, 200)
-				throw new ChainError(`DeepSeek search API failed (HTTP ${response.status}): ${detail}`, response.status === 429 ? 'RATE_LIMIT' : 'WEB_PROVIDER_ERROR')
+				throw new ChainError(`DeepSeek search API failed (HTTP ${response.status}): ${detail}`, response.status === 429 ? 'RATE_LIMIT' : 'WEB_PROVIDER_ERROR', {
+					permanent: [401, 402, 403, 404].includes(response.status),
+				})
 			}
 			if (!Array.isArray(payload?.results)) {
 				throw new ChainError('DeepSeek search API returned no results array', 'WEB_PROVIDER_ERROR')
@@ -939,14 +1011,17 @@ async function describeCredential(ctx, ref) {
 /**
  * 界面用的整份状态。
  *
- * 每个源带三块：
+ * 每个源带四块：
  * - `credential`：`{configured, source, writable}`（**从不含明文**）；
  * - `budget`：编辑用的预算（文档里的，或该模板的默认值；`null` = 不限）；
- * - `usage`：本月计数与闸门状态（`{month, used, monthly, reserve, remaining, exhausted, promo}`）。
+ * - `usage`：本月计数与闸门状态（`{month, used, monthly, reserve, remaining, exhausted, promo}`）；
+ * - `disabled`（手动停用，文档里）与 `autoDisabled`（自动停用，运行时状态 `{at, reason}` 或 null）——
+ *   两者都不参与搜索，但**都只停用、不删除**，界面可以随时恢复。
  */
 export async function readState(ctx) {
 	const { doc, error } = readConfigDocument(configPath())
 	const usage = readUsageDocument(usagePath())
+	const runtime = readRuntimeState(runtimePath())
 	const month = beijingMonthKey(Date.now())
 	const sources = []
 	for (const source of doc.sources) {
@@ -958,6 +1033,8 @@ export async function readState(ctx) {
 			budget,
 			credential: await describeCredential(ctx, source.ref),
 			usage: { month, ...budgetStatus(source, used, Date.now()) },
+			disabled: source.disabled === true,
+			autoDisabled: autoDisabledOf(runtime.state, source.id) ?? null,
 		})
 	}
 	return {
@@ -971,6 +1048,7 @@ export async function readState(ctx) {
 		fallback: { kind: 'deepseek', enabled: enabledFallback.size > 0 },
 		configError: error ?? null,
 		usageError: usage.error ?? null,
+		stateError: runtime.error ?? null,
 	}
 }
 
@@ -1084,8 +1162,27 @@ export async function applyConfig(ctx, body) {
 		}
 	}
 
+	// 用户点「恢复」：清掉自动停用标记（**只清标记，不删源**）
+	const restoredAuto = {}
+	if (Array.isArray(body?.resetAutoDisabled) && body.resetAutoDisabled.length > 0) {
+		try {
+			const known = new Set(validation.sources.map((source) => source.id))
+			let next = readRuntimeState(runtimePath()).state
+			for (const id of body.resetAutoDisabled) {
+				if (typeof id !== 'string' || !known.has(id)) continue
+				const before = autoDisabledOf(next, id)
+				if (before === undefined) continue
+				next = clearAutoDisable(next, id)
+				restoredAuto[id] = before
+			}
+			if (Object.keys(restoredAuto).length > 0) writeRuntimeState(runtimePath(), next)
+		} catch (error) {
+			warnings.push(`自动停用标记没清掉：${String(error)}`)
+		}
+	}
+
 	const state = await readState(ctx)
-	return respond(200, { ...state, applied: { setRefs, unsetRefs, warnings, usage: appliedUsage } })
+	return respond(200, { ...state, applied: { setRefs, unsetRefs, warnings, usage: appliedUsage, restoredAuto } })
 }
 
 /**

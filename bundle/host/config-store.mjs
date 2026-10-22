@@ -11,14 +11,17 @@ import { dirname, join } from 'node:path'
 import {
 	MAX_DOCUMENT_BYTES,
 	defaultDocument,
+	emptyRuntimeState,
 	emptyUsageDocument,
 	parseDocumentText,
+	parseRuntimeStateText,
 	parseUsageText,
 	serializeDocument,
+	serializeRuntimeState,
 	serializeUsageDocument,
 } from './core.mjs'
 
-/** 配置文件体积上限（用量文件比它更小，共用同一个上限做防呆）。 */
+/** 配置文件体积上限（用量/状态文件比它更小，共用同一个上限做防呆）。 */
 const MAX_USAGE_BYTES = MAX_DOCUMENT_BYTES
 
 /** 配置文档路径。 */
@@ -29,6 +32,15 @@ export function configDocumentPath(home) {
 /** 用量文档路径（本地额度计数；腾讯云没有查配额接口，这是唯一可编程的账本）。 */
 export function usageDocumentPath(home) {
 	return join(home, 'web-search-chain-usage.json')
+}
+
+/**
+ * 运行时状态路径（失败计数 + 自动停用标记）。
+ *
+ * 与配置文档**分文件**：自动停用是观察到的现象，不是用户的意图；配置文档只记 `disabled`（手动）。
+ */
+export function runtimeStatePath(home) {
+	return join(home, 'web-search-chain-state.json')
 }
 
 /**
@@ -102,6 +114,44 @@ export function readUsageDocument(path) {
 /** 原子写用量文档。 */
 export function writeUsageDocument(path, doc) {
 	const text = serializeUsageDocument(doc)
+	const temporary = `${path}.tmp`
+	mkdirSync(dirname(path), { recursive: true })
+	writeFileSync(temporary, text, 'utf8')
+	renameSync(temporary, path)
+}
+
+/**
+ * 读运行时状态（失败计数 + 自动停用）。**绝不抛**：读不了就当"没有自动停用"。
+ * @param path - 文档路径。
+ * @returns `{state, error}`。
+ */
+export function readRuntimeState(path) {
+	let size
+	try {
+		size = statSync(path).size
+	} catch (error) {
+		if (error?.code === 'ENOENT') return { state: emptyRuntimeState(), error: undefined }
+		return { state: emptyRuntimeState(), error: `状态文件不可读：${String(error)}` }
+	}
+	if (size > MAX_USAGE_BYTES) {
+		return { state: emptyRuntimeState(), error: `状态文件超过 ${MAX_USAGE_BYTES} 字节，已按空计` }
+	}
+	let text
+	try {
+		text = readFileSync(path, 'utf8')
+	} catch (error) {
+		return { state: emptyRuntimeState(), error: `状态文件不可读：${String(error)}` }
+	}
+	const parsed = parseRuntimeStateText(text)
+	return {
+		state: parsed.state,
+		error: parsed.error === undefined ? undefined : `状态文件损坏（${parsed.error}），已按空计`,
+	}
+}
+
+/** 原子写运行时状态。 */
+export function writeRuntimeState(path, state) {
+	const text = serializeRuntimeState(state)
 	const temporary = `${path}.tmp`
 	mkdirSync(dirname(path), { recursive: true })
 	writeFileSync(temporary, text, 'utf8')
