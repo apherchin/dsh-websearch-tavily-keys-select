@@ -143,7 +143,7 @@ dsh plugin --profile <你的 profile> add dsh-websearch-tavily-keys-select
 ### 测试（离线，任意 cwd）
 
 ```powershell
-node test\run-all.mjs         # 9 个测试文件 / 167 条（含 manifest 11、route 35、core-budget 14、tencent-sign 9）
+node test\run-all.mjs         # 9 个测试文件 / 164 条（含 manifest 11、route 35、core-budget 14、tencent-sign 9）
 node test\verify-client.mjs   # 客户端验证台：80/80（含合规守卫、注册 key 动态比对）
 node test\make-mutants.mjs    # 变异测试：14/14 必须被杀（含"拆掉额度闸门""月份键改 UTC""签名不做小写""停用的源照样被搜"）
 ```
