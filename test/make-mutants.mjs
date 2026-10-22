@@ -104,6 +104,13 @@ const MUTANTS = [
 		replace: 'return sources.slice()',
 		test: 'test/chain-provider.test.mjs',
 	},
+	{
+		name: 'M12 结果 URL 不剥 userinfo（伪装域名 / 像泄漏账号的地址会原样交给模型）',
+		file: 'bundle/host/index-v5.mjs',
+		find: 'const at = authority.lastIndexOf(\'@\')',
+		replace: 'const at = -1',
+		test: 'test/chain-provider.test.mjs',
+	},
 ]
 
 /** 复制正本（跳过 .tmp），返回副本根目录。 */

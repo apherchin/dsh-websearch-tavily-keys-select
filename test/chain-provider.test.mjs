@@ -220,7 +220,7 @@ const { usagePath, runtimePath } = await import('../bundle/host/index-v5.mjs')
 const { writeRuntimeState, readRuntimeState, readConfigDocument } = await import('../bundle/host/config-store.mjs')
 const { writeUsageDocument } = await import('../bundle/host/config-store.mjs')
 const { beijingMonthKey } = await import('../bundle/host/core.mjs')
-const { mapYuanbaoPages } = await import('../bundle/host/index-v5.mjs')
+const { mapYuanbaoPages, mapTavilySources, mapDeepseekApiSources, sanitizeUrl } = await import('../bundle/host/index-v5.mjs')
 
 const SECRET_KEY_REF = 'TENCENTCLOUD_SECRET_KEY'
 const SECRET_ID = 'AKIDtestSecretId0000000000000000'
@@ -372,10 +372,27 @@ await test('yuanbao 业务错误（HTTP 200 + Response.Error）⇒ 映射成腿�
 })
 
 await test('mapYuanbaoPages：脏元素跳过、去重、passage 优先、非数组当空', () => {
-	const pages = [JSON.stringify({ url: 'u1', passage: 'p', content: 'c' }), '{bad json', JSON.stringify({ url: 'u1' }), JSON.stringify({ title: '无 url' }), { url: 'u2' }]
-	assert.deepEqual(mapYuanbaoPages(pages), [{ url: 'u1', snippet: 'p' }, { url: 'u2' }])
+	const pages = [JSON.stringify({ url: 'https://a.example/1', passage: 'p', content: 'c' }), '{bad json', JSON.stringify({ url: 'https://a.example/1' }), JSON.stringify({ title: '无 url' }), { url: 'https://a.example/2' }]
+	assert.deepEqual(mapYuanbaoPages(pages), [{ url: 'https://a.example/1', snippet: 'p' }, { url: 'https://a.example/2' }])
 	assert.deepEqual(mapYuanbaoPages(undefined), [])
 	assert.deepEqual(mapYuanbaoPages('nope'), [])
+})
+
+await test('★结果 URL 规整：剥掉 userinfo（防伪冒域名/像泄漏的账号），非 http(s) 一律丢弃', () => {
+	// 真机 2026-10-22 抓到的三条原样地址
+	assert.equal(sanitizeUrl('http://foo:bar@www.python.org/downloads/release/python-3144/'), 'http://www.python.org/downloads/release/python-3144/')
+	assert.equal(sanitizeUrl('http://stan4402@github.org/deepseek-ai/deepseek-harness'), 'http://github.org/deepseek-ai/deepseek-harness')
+	assert.equal(sanitizeUrl('https://www.cnstock.com/commonDetail/759632'), 'https://www.cnstock.com/commonDetail/759632')
+	assert.equal(sanitizeUrl('javascript:alert(1)'), undefined)
+	assert.equal(sanitizeUrl('file:///C:/Windows'), undefined)
+	assert.equal(sanitizeUrl('不是 URL'), undefined)
+	assert.equal(sanitizeUrl(''), undefined)
+	assert.deepEqual(
+		mapYuanbaoPages([JSON.stringify({ url: 'http://uuuu:pppp@www.python.org/x', title: 't' }), JSON.stringify({ url: 'javascript:alert(1)' })]),
+		[{ url: 'http://www.python.org/x', title: 't' }],
+	)
+	assert.deepEqual(mapTavilySources({ results: [{ url: 'http://u:p@a.example/1', title: 't' }] }), [{ url: 'http://a.example/1', title: 't' }])
+	assert.deepEqual(mapDeepseekApiSources({ results: [{ url: 'http://u:p@b.example/2' }] }), [{ url: 'http://b.example/2' }])
 })
 
 await test('yuanbao 缺 SecretId ⇒ 记 credential-missing，不发请求', async () => {

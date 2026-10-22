@@ -170,6 +170,44 @@ function optionalString(value) {
 	return typeof value === 'string' && value.length > 0 ? value : undefined
 }
 
+/**
+ * 规整搜索结果的 URL：**只留 http(s)**，并**剥掉 userinfo**（`http://user:pass@host/…` 里的 `user:pass@`）。
+ *
+ * 为什么要剥（2026-10-22 真机发现）：元宝的 `Pages` 里真的会返回
+ * `http://foo:bar@www.python.org/…`、`http://stan4402@github.org/deepseek-ai/deepseek-harness` 这类地址——
+ * 前者长得像泄漏的账号密码，后者用 userinfo 伪装成 github.com 的仿冒站（`github.org`）。
+ * 我们的职责是"把结果原样交出去"没错，但**交给模型之前**把这种伪装剥掉，成本为零、收益明确：
+ * 展示/引用的 host 至少是真实的，仿冒站也骗不到"看起来像官方域名"这一步。
+ *
+ * 解析失败或非 http(s) 一律丢弃（返回 undefined），避免把 `javascript:` / `file:` 之类塞进搜索来源。
+ * @param value - 原始 URL 字符串。
+ * @returns 规整后的 URL，或 undefined。
+ */
+export function sanitizeUrl(value) {
+	if (typeof value !== 'string') return undefined
+	const raw = value.trim()
+	if (raw.length === 0) return undefined
+	let parsed
+	try {
+		parsed = new URL(raw)
+	} catch {
+		return undefined
+	}
+	if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return undefined
+	// 没有 userinfo ⇒ **原样返回**（交给模型的 URL 不做任何重写，避免 URL() 规范化的副作用：
+	// 给 `https://host` 补末尾斜杠、把 query 前的路径补成 `/` 之类）
+	if (parsed.username === '' && parsed.password === '') return raw
+	// 有 userinfo ⇒ 只用字符串手术剥掉它，其余部分逐字保留
+	const schemeEnd = raw.indexOf('://')
+	const rest = raw.slice(schemeEnd + 3)
+	const boundary = /[/?#]/.exec(rest)
+	const authorityEnd = boundary === null ? raw.length : schemeEnd + 3 + boundary.index
+	const authority = raw.slice(schemeEnd + 3, authorityEnd)
+	const at = authority.lastIndexOf('@')
+	if (at < 0) return raw
+	return `${raw.slice(0, schemeEnd + 3)}${authority.slice(at + 1)}${raw.slice(authorityEnd)}`
+}
+
 /** 把可选整数字段夹到合理范围，不可用时回退。 */
 function clampInteger(value, min, max, fallback) {
 	return Number.isInteger(value) && value >= min && value <= max ? value : fallback
@@ -253,12 +291,12 @@ async function loadDeepSeekProviderClass() {
 }
 
 /** 把 Tavily `/search` 响应映射成 seam 的 `WebSearchResult.sources`。 */
-function mapTavilySources(payload) {
+export function mapTavilySources(payload) {
 	const sources = []
 	const seen = new Set()
 	for (const item of Array.isArray(payload?.results) ? payload.results : []) {
-		const url = typeof item?.url === 'string' ? item.url : ''
-		if (url.length === 0 || seen.has(url)) continue
+		const url = sanitizeUrl(item?.url)
+		if (url === undefined || seen.has(url)) continue
 		seen.add(url)
 		sources.push({
 			url,
@@ -283,8 +321,8 @@ export function mapDeepseekApiSources(payload) {
 	const sources = []
 	const seen = new Set()
 	for (const item of Array.isArray(payload?.results) ? payload.results : []) {
-		const url = typeof item?.url === 'string' ? item.url : ''
-		if (url.length === 0 || seen.has(url)) continue
+		const url = sanitizeUrl(item?.url)
+		if (url === undefined || seen.has(url)) continue
 		seen.add(url)
 		sources.push({
 			url,
@@ -319,8 +357,8 @@ export function mapYuanbaoPages(pages) {
 			}
 		}
 		if (item === null || typeof item !== 'object') continue
-		const url = typeof item.url === 'string' ? item.url : ''
-		if (url.length === 0 || seen.has(url)) continue
+		const url = sanitizeUrl(item.url)
+		if (url === undefined || seen.has(url)) continue
 		seen.add(url)
 		const passage = typeof item.passage === 'string' && item.passage.length > 0 ? item.passage : undefined
 		const content = typeof item.content === 'string' && item.content.length > 0 ? item.content : undefined
