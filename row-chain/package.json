@@ -24,7 +24,7 @@
     }
   },
   "dependencies": {
-    "dsh-websearch-tavily-keys-select": "^2.0.0"
+    "dsh-websearch-tavily-keys-select": "^3.0.0"
   },
   "keywords": [
     "dsh",

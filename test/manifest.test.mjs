@@ -70,7 +70,9 @@ await test('两个行包的 index.mjs 都按**包名** re-export 同一个宿主
 await test('两个行包都声明了 bundle 包依赖（裸包名导入要能解析）', () => {
 	for (const rel of ['row-chain/package.json', 'row-deepseek/package.json']) {
 		const pkg = readJson(rel)
-		assert.equal(pkg.dependencies?.['dsh-websearch-tavily-keys-select'], '^2.0.0', rel)
+		// 跟着 bundle 的版本走：升版本时只需要改 bundle/package.json
+		const bundleVersion = readJson('bundle/package.json').version
+		assert.equal(pkg.dependencies?.['dsh-websearch-tavily-keys-select'], `^${bundleVersion}`, rel)
 		assert.equal(pkg.private, undefined, `${rel} 的 private 必须去掉`)
 	}
 })
@@ -78,7 +80,7 @@ await test('两个行包都声明了 bundle 包依赖（裸包名导入要能解
 await test('bundle 包只声明两个行包依赖（发布用版本号；file: 无法发布）', () => {
 	const pkg = readJson('bundle/package.json')
 	assert.deepEqual(pkg.dependencies, {
-		'dsh-search-chain': '^2.0.0',
+		'dsh-search-chain': `^${readJson('row-chain/package.json').version}`,
 		'dsh-search-deepseek': '^1.0.0',
 	})
 })
