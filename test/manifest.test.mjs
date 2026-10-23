@@ -1,4 +1,18 @@
 import { readFileSync } from 'node:fs'
+
+/**
+ * 极简 semver：判断 `^X.Y.Z` 是否覆盖版本 `V`（只处理本项目用到的 caret 形式）。
+ * 例：covers('^3.0.0', '3.0.1') === true；covers('^2.0.0', '3.0.0') === false。
+ */
+const covers = (range, version) => {
+	const caret = /^\^(\d+)\.(\d+)\.(\d+)$/.exec(String(range).trim())
+	const target = /^(\d+)\.(\d+)\.(\d+)/.exec(String(version).trim())
+	if (caret === null || target === null) return false
+	const [rMajor, rMinor, rPatch] = [Number(caret[1]), Number(caret[2]), Number(caret[3])]
+	const [vMajor, vMinor, vPatch] = [Number(target[1]), Number(target[2]), Number(target[3])]
+	if (rMajor === 0) return vMajor === 0 && vMinor === rMinor && vPatch >= rPatch
+	return vMajor === rMajor && (vMinor > rMinor || (vMinor === rMinor && vPatch >= rPatch))
+}
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { test, summary, assert } from './harness.mjs'
@@ -70,19 +84,18 @@ await test('两个行包的 index.mjs 都按**包名** re-export 同一个宿主
 await test('两个行包都声明了 bundle 包依赖（裸包名导入要能解析）', () => {
 	for (const rel of ['row-chain/package.json', 'row-deepseek/package.json']) {
 		const pkg = readJson(rel)
-		// 跟着 bundle 的版本走：升版本时只需要改 bundle/package.json
-		const bundleVersion = readJson('bundle/package.json').version
-		assert.equal(pkg.dependencies?.['dsh-websearch-tavily-keys-select'], `^${bundleVersion}`, rel)
+		// 声明的范围必须覆盖 bundle 的当前版本
+		assert.equal(covers(pkg.dependencies?.['dsh-websearch-tavily-keys-select'], readJson('bundle/package.json').version), true, rel)
 		assert.equal(pkg.private, undefined, `${rel} 的 private 必须去掉`)
 	}
 })
 
 await test('bundle 包只声明两个行包依赖（发布用版本号；file: 无法发布）', () => {
 	const pkg = readJson('bundle/package.json')
-	assert.deepEqual(pkg.dependencies, {
-		'dsh-search-chain': `^${readJson('row-chain/package.json').version}`,
-		'dsh-search-deepseek': `^${readJson('row-deepseek/package.json').version}`,
-	})
+	assert.deepEqual(Object.keys(pkg.dependencies).sort(), ['dsh-search-chain', 'dsh-search-deepseek'])
+	// 声明的是 caret 范围：只要**覆盖**行包当前版本就行（`^3.0.0` 覆盖 3.0.1）
+	assert.equal(covers(pkg.dependencies['dsh-search-chain'], readJson('row-chain/package.json').version), true, pkg.dependencies['dsh-search-chain'])
+	assert.equal(covers(pkg.dependencies['dsh-search-deepseek'], readJson('row-deepseek/package.json').version), true, pkg.dependencies['dsh-search-deepseek'])
 })
 
 await test('两个行包只依赖 bundle 包，且不依赖任何 @deepseek-ai 包（host 侧零 @deepseek-ai 依赖）', () => {

@@ -1,6 +1,6 @@
 {
   "name": "dsh-search-chain",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "type": "module",
   "main": "index.mjs",
   "description": "链本体（三级模型：源 → key → 额度，按 key 记账/闸门/自动停用）：注册 web_search 的 provider 并供应配置卡片。由 dsh-websearch-tavily-keys-select 依赖，通常无需单独安装。",
