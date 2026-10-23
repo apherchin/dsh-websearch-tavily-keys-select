@@ -26,7 +26,7 @@
   },
   "dependencies": {
     "dsh-search-chain": "^3.0.0",
-    "dsh-search-deepseek": "^1.0.0"
+    "dsh-search-deepseek": "^1.1.0"
   },
   "keywords": [
     "dsh",

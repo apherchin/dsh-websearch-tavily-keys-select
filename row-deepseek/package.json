@@ -1,6 +1,6 @@
 {
   "name": "dsh-search-deepseek",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "main": "index.mjs",
   "description": "官方 DeepSeek 搜索兜底：Tavily 源全部失败或未配置时使用（会花官方余额）。由 dsh-websearch-tavily-keys-select 依赖，通常无需单独安装。",

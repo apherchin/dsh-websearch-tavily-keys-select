@@ -81,7 +81,7 @@ await test('bundle 包只声明两个行包依赖（发布用版本号；file: �
 	const pkg = readJson('bundle/package.json')
 	assert.deepEqual(pkg.dependencies, {
 		'dsh-search-chain': `^${readJson('row-chain/package.json').version}`,
-		'dsh-search-deepseek': '^1.0.0',
+		'dsh-search-deepseek': `^${readJson('row-deepseek/package.json').version}`,
 	})
 })
 
