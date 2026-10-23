@@ -22,7 +22,7 @@
 
 - **省钱 + 不超额**：元宝搜索有自己的免费额度（**日常 2000 次/自然月/UIN**），超额按量计费且**贵**（标准版 20 元/千次，是 DeepSeek 搜索 API 的约 4 倍）；
   官方 DeepSeek 搜索**会花官方余额**。链路因此在元宝源上带**本地月度额度闸门**：到点就跳过它，不花超额的钱。
-- **多个源轮换**：最多 3 个源按顺序试，某个 key 失效、超时或额度用完会**自动试下一个**，不用手改配置。
+- **多个源轮换**：最多 4 个源按顺序试，某个 key 失效、超时或额度用完会**自动试下一个**，不用手改配置。
 - **密钥不进 DSH 的明文**：SecretKey / Tavily key 优先用 **Windows 环境变量**（密钥留在系统里）；
   只有 **SecretId** 明文存在配置文档里（它按腾讯云的定义是"类比用户名"的标识，且必须方便更换）。
 - **可换**：SecretId 在卡片上直接改；SecretKey 换环境变量的值（或改成明文模式）；额度/保留余量也在卡片上改。
@@ -89,13 +89,33 @@ dsh plugin --profile <你的 profile> add dsh-websearch-tavily-keys-select
 
 ### 怎么配
 
-| 源 | 必填 | 说明 |
-|---|---|---|
-| 腾讯元宝搜索 | **SecretId** + SecretKey（环境变量名或明文）+ 可选额度 | SecretId 明文存在配置文档里（可随时改）；SecretKey 默认读 `TENCENTCLOUD_SECRET_KEY` |
-| DeepSeek 搜索 API | key（环境变量名或明文） | `DEEPSEEK_API_KEY`（5 元/千次，成功才计费） |
-| Tavily | key（环境变量名或明文） | `TAVILY_API_KEY1` / `TAVILY_API_KEY2` 之类 |
+**三级模型（2026-10-23 起）：源 → key → 额度**。一个源可以放**多把 key**（每源最多 4 把），
+每把 key 有**自己的额度**、可以单独 enable / disable / delete；**一个源就是一份账单**（计费单位 + 可选单价）。
 
-- **源的顺序 = 尝试顺序**；最多 **4 个**源；每个源失败自动降级到下一个。
+```jsonc
+{
+  "version": 3,
+  "sources": [
+    {
+      "id": "s1", "kind": "tavily",
+      "billing": { "unit": "credits", "pricePer1000": 0 },   // 源级：单位 + 可选单价（元/千单位）
+      "disabled": false,                                     // 源级停用（key 与配置都保留）
+      "keys": [                                              // 最多 4 把
+        { "id": "k1", "mode": "env", "ref": "TAVILY_API_KEY1", "budget": { "monthly": 1000, "reserve": 50 } },
+        { "id": "k2", "mode": "env", "ref": "TAVILY_API_KEY2", "budget": { "monthly": 1000, "reserve": 50 }, "disabled": true }
+      ]
+    }
+  ]
+}
+```
+
+- **腿序 = 源按文档顺序 × 源内 key 按顺序**：key1 额度用完自动换同源的 key2；整个源的 key 都不可用（用完/停用/自动停用）
+  ⇒ 换下一个源。上限：**4 个源 × 4 把 key**。
+- **账本按 key 记**（`{"2026-10":{"k1":{"calls":3,"credits":5}}}`），所以"哪把 key 花了多少"一眼可查；卡片上每把 key 各有「查额度」。
+- **源级计费方式**：单位取 `billing.unit`（缺省按模板：元宝/DS = `calls`，Tavily = `credits`），
+  填了 `pricePer1000` 就在源卡上显示"本月 ≈ ¥X"。
+- **旧配置自动迁移**：v2 的"一个源一把 key"会原样搬成"单 key 源"，**key id 沿用源 id** ⇒ 账本与自动停用标记无缝续上。
+- 界面上：**一个源一张卡**，卡内每把 key 一行（启用 / 删除 / 额度 / 查额度 / 恢复自动停用），卡头有「＋ 加一把 key」与「删除源」。
 - **官方兜底**：页面里 `DS_OFFICIAL` 那个开关。本机 2026-10-22 起**已关掉**（改用 DS 搜索 API 兜底）——关掉就不花官方余额。
 - **停用（disable，不是删除）**：每个源行首有「启用」勾选框，取消勾选 ⇒ 该源**留在配置里**但不再参与搜索（密钥、顺序、额度设置都保留，随时可勾回来）。
 - **自动停用**：某源**连续 3 次确定性失败**（鉴权失败 / 套餐超限 / 404 这类"不修就一直失败"的错误）后，宿主自动把它摘出链路，卡片上显示原因与「恢复」按钮；超时、429、5xx 属于暂时性失败，**不累计**。
@@ -146,9 +166,9 @@ dsh plugin --profile <你的 profile> add dsh-websearch-tavily-keys-select
 ### 测试（离线，任意 cwd）
 
 ```powershell
-node test\run-all.mjs         # 9 个测试文件 / 165 条（含 manifest 11、route 35、core-budget 14、tencent-sign 9）
-node test\verify-client.mjs   # 客户端验证台：80/80（含合规守卫、注册 key 动态比对）
-node test\make-mutants.mjs    # 变异测试：16/16 必须被杀（含"拆掉额度闸门""月份键改 UTC""签名不做小写""停用的源照样被搜"）
+node test\run-all.mjs         # 9 个测试文件 / 168 条（含 manifest 11、route 35、core-budget 14、tencent-sign 9）
+node test\verify-client.mjs   # 客户端验证台：70/70（含合规守卫、注册 key 动态比对）
+node test\make-mutants.mjs    # 变异测试：18/18 必须被杀（含"拆掉额度闸门""月份键改 UTC""签名不做小写""停用的源照样被搜"）
 ```
 
 > ⚠️ 别用 `node --test`：本机沙箱禁命名管道，runner 会 spawn EPERM 并给出误导性的 `# fail 1`。

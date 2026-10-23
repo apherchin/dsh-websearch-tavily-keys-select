@@ -597,6 +597,41 @@ await test('★Tavily 按 credit 记额度：预算 2 ⇒ advanced 一次（cred
 		stubFetch(realFetch)
 	}
 })
+await test('★一个源两把 key：key1 额度用尽 ⇒ 自动换同源的 key2；账本按 key 分开记', async () => {
+	const { provider } = mountChain({ credentials: makeFakeCredentials({ values: { K1: 'k1', K2: 'k2' } }) })
+	resetUsage()
+	setDoc([
+		{
+			id: 'tavily',
+			kind: 'tavily',
+			billing: { unit: 'credits' },
+			keys: [
+				{ id: 'ka', mode: 'env', ref: 'K1', budget: { monthly: 2, reserve: 0 } },
+				{ id: 'kb', mode: 'env', ref: 'K2' },
+			],
+		},
+	])
+	const refs = []
+	stubFetch(async (url, init) => {
+		refs.push(init.headers.authorization)
+		return tavilyOk(['https://a'], 2)
+	})
+	try {
+		await provider.search({ query: 'q' }, undefined)
+		// key1 的 credit 预算 2 已被这一次用满 ⇒ 第二次必须换 key2（换成 K2 的凭据）
+		await provider.search({ query: 'q' }, undefined)
+		assert.deepEqual(refs, ['Bearer k1', 'Bearer k2'], '第二次应当用同源的第二把 key')
+		const month = beijingMonthKey(Date.now())
+		const { readUsageDocument } = await import('../bundle/host/config-store.mjs')
+		const usage = readUsageDocument(usagePath())
+		assert.equal(usage.doc.months[month].ka.credits, 2, JSON.stringify(usage.doc))
+		assert.equal(usage.doc.months[month].kb.credits, 2, JSON.stringify(usage.doc))
+		assert.equal(usage.doc.months[month].tavily, undefined, '账本不能记在源 id 上')
+	} finally {
+		stubFetch(realFetch)
+	}
+})
+
 //#region 停用：手动（配置里）与自动（运行时状态）——都是 disable，不是 delete
 await test('手动停用（disabled）的源被跳过：不解析凭据、不发请求，但源还在配置里', async () => {
 	const credentials = makeFakeCredentials({ values: { K1: 'k1', K2: 'k2' } })

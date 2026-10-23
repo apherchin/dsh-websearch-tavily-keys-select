@@ -460,7 +460,8 @@ export function migrateV2Sources(rawSources) {
 		const key = { id: raw.id, mode: raw.mode, ref: raw.ref }
 		if (typeof raw.secretId === 'string') key.secretId = raw.secretId
 		if (raw.budget !== undefined) key.budget = raw.budget
-		if (raw.disabled === true) key.disabled = true
+		// 原样带过去（哪怕是非法值），交给统一校验去报错，避免静默丢弃
+		if (raw.disabled !== undefined) key.disabled = raw.disabled
 		return { id: raw.id, kind: raw.kind, keys: [key] }
 	})
 }
@@ -486,7 +487,7 @@ export function parseDocumentText(text) {
 	if (!isPlainObject(parsed)) return { doc: defaultDocument(), error: 'configuration must be a JSON object' }
 	if (!Array.isArray(parsed.sources)) return { doc: defaultDocument(), error: 'configuration.sources must be an array' }
 	// v2 判定：显式 version===2，或（没有 version 且源上直接带 mode/ref 而没有 keys）
-	const isV2 = parsed.version === 2 || (parsed.version === undefined && parsed.sources.some((raw) => isPlainObject(raw) && raw.keys === undefined))
+	const isV2 = parsed.version === 2 || parsed.sources.some((raw) => isPlainObject(raw) && raw.keys === undefined && raw.mode !== undefined)
 	const rawSources = isV2 ? migrateV2Sources(parsed.sources) : parsed.sources
 	if (rawSources.length > MAX_SOURCES) {
 		return { doc: defaultDocument(), error: `configuration lists more than ${MAX_SOURCES} sources` }
@@ -519,7 +520,8 @@ export function parseDocumentText(text) {
 			if (raw.disabled) source.disabled = true
 		}
 		for (const [keyIndex, rawKey] of raw.keys.entries()) {
-			const parsedKey = parseKeyRow(rawKey, raw.kind, `${atSource}.keys[${keyIndex}]`)
+			const keyPath = isV2 ? atSource : `${atSource}.keys[${keyIndex}]`
+			const parsedKey = parseKeyRow(rawKey, raw.kind, keyPath)
 			if (parsedKey.error !== undefined) return { doc: defaultDocument(), error: parsedKey.error }
 			source.keys.push(parsedKey.key)
 		}
@@ -792,6 +794,7 @@ export function orderedLegs(sources, fallback) {
 }
 /** 一个源里**还有可用 key**（手动未停用、也未自动停用）——注意这里不看额度。 */
 export function sourceHasUsableKey(source, runtime) {
+	if (source.disabled === true) return false
 	// 兼容 v2 形状（没有 keys）：源本身就是唯一那把 key
 	if (!Array.isArray(source.keys)) return autoDisabledOf(runtime, source.id) === undefined
 	return source.keys.some((key) => key.disabled !== true && autoDisabledOf(runtime, key.id) === undefined)

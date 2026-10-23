@@ -25,14 +25,14 @@ const MUTANTS = [
 	{
 		name: 'M1 源顺序倒过来（腿序不再按文档顺序）',
 		file: 'bundle/host/core.mjs',
-		find: 'const legs = sources.map((source) => ({ kind: source.kind, id: source.id, ref: source.ref }))',
-		replace: 'const legs = sources.slice().reverse().map((source) => ({ kind: source.kind, id: source.id, ref: source.ref }))',
+		find: 'const legs = []\n\tfor (const source of sources) {',
+		replace: 'const legs = []\n\tfor (const source of sources.slice().reverse()) {',
 		test: 'test/core-chain.test.mjs',
 	},
 	{
 		name: 'M2 忽略 mode（一律按 env 解析，明文源失效）',
 		file: 'bundle/host/core.mjs',
-		find: "if (raw.mode === 'env') {",
+		find: "if (rawKey.mode === 'env') {",
 		replace: 'if (true) {',
 		test: 'test/core-validate.test.mjs',
 	},
@@ -64,7 +64,7 @@ const MUTANTS = [
 		// 2026-10-22 起 Tavily 腿也有闸门（按 credit），所以这里锚在"按单位算 used"那一行，保证唯一。
 		name: 'M6 拆掉额度闸门（超额照发，会真花钱）',
 		file: 'bundle/host/index-v5.mjs',
-		find: 'const status = budgetStatus(source, usedInUnit, this.now())',
+		find: 'const status = budgetStatus(keyBudget(source, key), usedInUnit, this.now())',
 		replace: 'const status = { exhausted: false, monthly: null, reserve: 0, used: 0, remaining: null, unlimited: true }',
 		test: 'test/chain-provider.test.mjs',
 	},
@@ -78,8 +78,8 @@ const MUTANTS = [
 	{
 		name: 'M8 不校验 SecretId（yuanbao 源能存成死源）',
 		file: 'bundle/host/core.mjs',
-		find: "if (!SECRET_ID_PATTERN.test(secretId)) {\n\t\t\t\treturn failure('INVALID_SECRET_ID'",
-		replace: "if (false) {\n\t\t\t\treturn failure('INVALID_SECRET_ID'",
+		find: "if (!SECRET_ID_PATTERN.test(secretId)) {\n\t\t\t\t\treturn failure('INVALID_SECRET_ID'",
+		replace: "if (false) {\n\t\t\t\t\treturn failure('INVALID_SECRET_ID'",
 		test: 'test/core-validate.test.mjs',
 	},
 	{
@@ -100,9 +100,9 @@ const MUTANTS = [
 	{
 		name: 'M11 停用的源照样被搜索（selectableSources 不过滤 disabled / 自动停用）',
 		file: 'bundle/host/core.mjs',
-		find: 'return sources.filter((source) => source.disabled !== true && autoDisabledOf(runtime, source.id) === undefined)',
-		replace: 'return sources.slice()',
-		test: 'test/chain-provider.test.mjs',
+		find: 'export function selectableSources(sources, runtime) {',
+		replace: 'export function selectableSources(sources, runtime) {\n\treturn sources.slice()',
+		test: 'test/core-chain.test.mjs',
 	},
 	{
 		name: 'M12 结果 URL 不剥 userinfo（伪装域名 / 像泄漏账号的地址会原样交给模型）',
@@ -137,6 +137,20 @@ const MUTANTS = [
 		file: 'bundle/host/index-v5.mjs',
 		find: 'freshness = `d${Math.min(count, 30)}`',
 		replace: 'freshness = `d${count}`',
+		test: 'test/chain-provider.test.mjs',
+	},
+	{
+		name: 'M17 源内只跑第一把 key（第二把永远轮不到，等于回到"一源一 key"）',
+		file: 'bundle/host/core.mjs',
+		find: 'for (const key of source.keys ?? []) {',
+		replace: 'for (const key of (source.keys ?? []).slice(0, 1)) {',
+		test: 'test/core-chain.test.mjs',
+	},
+	{
+		name: 'M18 记账按源而不是按 key（多把 key 共用一本账，额度判断会错）',
+		file: 'bundle/host/index-v5.mjs',
+		find: 'const calls = this.bumpUsage(key.id, month)',
+		replace: 'const calls = this.bumpUsage(source.id, month)',
 		test: 'test/chain-provider.test.mjs',
 	},
 ]

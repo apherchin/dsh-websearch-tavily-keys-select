@@ -58,8 +58,8 @@ await test('disabled：手动停用能往返（只在 true 时写这个字段）
 	}
 	const text = serializeDocument(doc)
 	assert.ok(text.includes('"disabled": true'), text)
-	assert.equal(parseDocumentText(text).doc.sources[0].disabled, true)
-	assert.equal('disabled' in parseDocumentText(text).doc.sources[1], false, 'false 不落盘')
+	assert.equal(parseDocumentText(text).doc.sources[0].keys[0].disabled, true)
+	assert.equal('disabled' in parseDocumentText(text).doc.sources[1].keys[0], false, 'false 不落盘')
 	assert.ok(parseDocumentText('{"version":2,"sources":[{"id":"s1","kind":"tavily","mode":"env","ref":"K1","disabled":"yes"}]}').error !== undefined)
 })
 
@@ -67,10 +67,11 @@ await test('序列化 → 解析 往返一致（含 secretId 与完整 budget）
 	const doc = { version: DOCUMENT_VERSION, sources: [YUANBAO, { id: 's2', kind: 'tavily', mode: 'literal', ref: 'WEB_SEARCH_TAVILY_1' }] }
 	const text = serializeDocument(doc)
 	assert.ok(text.endsWith('}\n'))
-	assert.equal(text.includes('"version": 2'), true)
+	assert.equal(text.includes('"version": 3'), true)
 	const parsed = parseDocumentText(text)
 	assert.equal(parsed.error, undefined)
-	assert.deepEqual(parsed.doc.sources, doc.sources)
+	// v2 形状写进去会被迁成三级结构（key id 沿用源 id），这里断言迁移后的形状
+	assert.deepEqual(parsed.doc.sources, [{ id: 's1', kind: 'yuanbao', keys: [{ id: 's1', mode: 'env', ref: 'TENCENTCLOUD_SECRET_KEY', secretId: 'AKIDtestSecretId0000000000000000', budget: YUANBAO.budget }] }, { id: 's2', kind: 'tavily', keys: [{ id: 's2', mode: 'literal', ref: 'WEB_SEARCH_TAVILY_1' }] }])
 })
 
 await test('serializeDocument：只写该写的字段（tavily 源不会凭空长出 secretId/budget）', () => {
@@ -144,7 +145,7 @@ await test('budget.monthly = 0 ⇒ 合法（不限），serialize 往返保留',
 	const source = { ...YUANBAO, budget: { monthly: 0, reserve: 0 } }
 	const parsed = parseDocumentText(JSON.stringify({ sources: [source] }))
 	assert.equal(parsed.error, undefined)
-	assert.deepEqual(parsed.doc.sources[0].budget, { monthly: 0, reserve: 0 })
+	assert.deepEqual(parsed.doc.sources[0].keys[0].budget, { monthly: 0, reserve: 0 })
 })
 
 await test('重复 id / 重复 ref ⇒ 退默认 + error', () => {

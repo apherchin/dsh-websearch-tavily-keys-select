@@ -1,5 +1,6 @@
 import { test, summary, assert } from './harness.mjs'
 import {
+	orderedKeyLegs,
 	orderedLegs,
 	unusedRefs,
 	describeAttempts,
@@ -89,6 +90,32 @@ await test('selectableSources：手动停用与自动停用都被跳过，其余
 	const runtime = { sources: { s3: { fails: 3, autoDisabledAt: '2026-10-22T05:00:00.000Z', reason: 'HTTP 432' } } }
 	assert.deepEqual(selectableSources(sources, runtime).map((source) => source.id), ['s1'])
 	assert.deepEqual(selectableSources(sources, undefined).map((source) => source.id), ['s1', 's3'])
+})
+
+await test('orderedKeyLegs：按源顺序 × 源内 key 顺序，跳过停用的源/key 与自动停用的 key', () => {
+	const sources = [
+		{ id: 's1', kind: 'yuanbao', keys: [{ id: 'k1', mode: 'env', ref: 'A' }, { id: 'k2', mode: 'env', ref: 'B' }] },
+		{ id: 's2', kind: 'tavily', disabled: true, keys: [{ id: 'k3', mode: 'env', ref: 'C' }] },
+		{ id: 's3', kind: 'tavily', keys: [{ id: 'k4', mode: 'env', ref: 'D', disabled: true }, { id: 'k5', mode: 'env', ref: 'E' }] },
+	]
+	const runtime = { sources: { k5: { fails: 3, autoDisabledAt: '2026-10-22T05:00:00.000Z', reason: 'HTTP 432' } } }
+	assert.deepEqual(orderedKeyLegs(sources, runtime, undefined).map((leg) => leg.keyId), ['k1', 'k2'])
+	assert.deepEqual(orderedKeyLegs(sources, undefined, undefined).map((leg) => leg.keyId), ['k1', 'k2', 'k5'])
+	assert.deepEqual(orderedKeyLegs(sources, undefined, undefined).map((leg) => leg.sourceId), ['s1', 's1', 's3'])
+	assert.deepEqual(orderedKeyLegs(sources, undefined, { slot: 'deepseek', keyRef: 'DEEPSEEK_API_KEY' }).map((leg) => leg.kind), ['yuanbao', 'yuanbao', 'tavily', 'deepseek'])
+})
+
+await test('selectableSources：整源停用 / 全部 key 停用 / key 被自动停用 三种情况都不算可用', () => {
+	const sources = [
+		{ id: 's1', kind: 'tavily', keys: [{ id: 'k1', mode: 'env', ref: 'A' }] },
+		{ id: 's2', kind: 'tavily', disabled: true, keys: [{ id: 'k2', mode: 'env', ref: 'B' }] },
+		{ id: 's3', kind: 'tavily', keys: [{ id: 'k3', mode: 'env', ref: 'C', disabled: true }] },
+		{ id: 's4', kind: 'tavily', keys: [{ id: 'k4', mode: 'env', ref: 'D' }, { id: 'k5', mode: 'env', ref: 'E' }] },
+	]
+	const runtime = { sources: { k4: { fails: 3, autoDisabledAt: '2026-10-22T05:00:00.000Z', reason: 'HTTP 432' } } }
+	assert.deepEqual(selectableSources(sources, runtime).map((source) => source.id), ['s1', 's4'])
+	// 没有运行时状态时，s3 仍因「唯一那把 key 停用」而不可用
+	assert.deepEqual(selectableSources(sources, undefined).map((source) => source.id), ['s1', 's4'])
 })
 
 await test(`recordFailure：连到第 ${AUTO_DISABLE_THRESHOLD} 次才自动停用（并记原因/时间）；recordSuccess 清零`, () => {

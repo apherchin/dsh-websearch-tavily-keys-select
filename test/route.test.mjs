@@ -110,23 +110,29 @@ await test('GET：文件不存在时给默认文档 + 默认凭据状态 + 模�
 	const { status, body } = await readResponse(await get(ctx))
 	assert.equal(status, 200)
 	assert.equal(body.ok, true)
-	assert.equal(body.version, 2)
+	assert.equal(body.version, 3)
 	assert.equal(body.maxSources, MAX_SOURCES)
 	assert.deepEqual(body.templates, [
-		{ kind: 'yuanbao', label: '腾讯元宝搜索', refExample: 'TENCENTCLOUD_SECRET_KEY' },
-		{ kind: 'deepseek-api', label: 'DeepSeek 搜索 API', refExample: 'DEEPSEEK_API_KEY' },
-		{ kind: 'tavily', label: 'Tavily Key', refExample: 'TAVILY_API_KEY' },
+		{ kind: 'yuanbao', label: '腾讯元宝搜索', refExample: 'TENCENTCLOUD_SECRET_KEY', unit: 'calls' },
+		{ kind: 'deepseek-api', label: 'DeepSeek 搜索 API', refExample: 'DEEPSEEK_API_KEY', unit: 'calls' },
+		{ kind: 'tavily', label: 'Tavily Key', refExample: 'TAVILY_API_KEY', unit: 'credits' },
 	])
 	const month = beijingMonthKey(Date.now())
 	// 默认文档是两个 Tavily 源 ⇒ 计量单位是 credits
 	const unlimitedUsage = { month, unit: 'credits', calls: 0, credits: 0, unlimited: true, monthly: null, reserve: 0, used: 0, remaining: null, exhausted: false, promo: null }
+	const keyRow = (id, ref) => ({ id, mode: 'env', ref, budget: null, credential: { configured: false, writable: true }, usage: unlimitedUsage, disabled: false, autoDisabled: null })
 	assert.deepEqual(body.sources, [
-		// ⚠️ 注意没有 `source` 键：`Response.json` 序列化会丢掉值为 undefined 的键。
-		// 界面因此只能按 `configured` / `writable` 分支（不去读 source）—— 与 spec §7 一致。
-		// 同一条教训在本仓库 session-delete 上踩过：attached=undefined 时该键在 JSON 里消失。
-		// 默认文档 = 两条 Tavily（key1 → key2，2026-09-29 用户选定）。
-		{ id: 's1', kind: 'tavily', mode: 'env', ref: 'TAVILY_API_KEY1', budget: null, credential: { configured: false, writable: true }, usage: unlimitedUsage, disabled: false, autoDisabled: null },
-		{ id: 's2', kind: 'tavily', mode: 'env', ref: 'TAVILY_API_KEY2', budget: null, credential: { configured: false, writable: true }, usage: unlimitedUsage, disabled: false, autoDisabled: null },
+		{
+			id: 's1',
+			kind: 'tavily',
+			billing: { unit: 'credits', pricePer1000: null },
+			disabled: false,
+			keys: [keyRow('k1', 'TAVILY_API_KEY1'), keyRow('k2', 'TAVILY_API_KEY2')],
+			usage: { month, unit: 'credits', calls: 0, credits: 0, used: 0, spend: null },
+			available: true,
+			exhausted: false,
+			usableKeys: 2,
+		},
 	])
 	assert.deepEqual(body.defaults, {
 		budgets: {
@@ -148,7 +154,8 @@ await test('GET：文档损坏时照常 200，并用 configError 告知界面', 
 	const { status, body } = await readResponse(await get(ctx))
 	assert.equal(status, 200)
 	assert.ok(typeof body.configError === 'string' && body.configError.includes('损坏'), body.configError)
-	assert.equal(body.sources.length, 2, '损坏时退成默认文档（两条）')
+	assert.equal(body.sources.length, 1, '损坏时退成默认文档（一个源、两把 key）')
+	assert.equal(body.sources[0].keys.length, 2)
 })
 
 await test('GET：兜底行挂载后 fallback.enabled = true', async () => {
@@ -216,7 +223,7 @@ await test('POST 合法 env 提交 ⇒ 200、文档落盘、返回 applied', asy
 	assert.equal(status, 200)
 	assert.equal(body.ok, true)
 	assert.deepEqual(body.applied, { setRefs: [], unsetRefs: [], warnings: [], usage: {}, restoredAuto: {} })
-	assert.deepEqual(readConfigDocument(configPath()).doc.sources, [{ id: 's1', kind: 'tavily', mode: 'env', ref: 'TAVILY_API_KEY9' }])
+	assert.deepEqual(readConfigDocument(configPath()).doc.sources, [{ id: 's1', kind: 'tavily', keys: [{ id: 's1', mode: 'env', ref: 'TAVILY_API_KEY9' }] }])
 	assert.equal(body.sources[0].ref, 'TAVILY_API_KEY9')
 })
 
@@ -228,7 +235,7 @@ await test('POST 明文 ⇒ 调 credentials.set(ref, value)，响应里**没有*
 	assert.deepEqual(credentials.calls.set, [['WEB_SEARCH_TAVILY_1', 'tvly-secret']])
 	assert.deepEqual(body.applied.setRefs, ['WEB_SEARCH_TAVILY_1'])
 	assert.equal(JSON.stringify(body).includes('tvly-secret'), false, '响应里绝不能出现明文')
-	assert.deepEqual(readConfigDocument(configPath()).doc.sources, [{ id: 's1', kind: 'tavily', mode: 'literal', ref: 'WEB_SEARCH_TAVILY_1' }])
+	assert.deepEqual(readConfigDocument(configPath()).doc.sources, [{ id: 's1', kind: 'tavily', keys: [{ id: 's1', mode: 'literal', ref: 'WEB_SEARCH_TAVILY_1' }] }])
 })
 
 await test('POST 明文留空（不带 secret）⇒ 不调 set，引用名与密钥都保持', async () => {
@@ -270,7 +277,7 @@ await test('POST literal 但该 ref 只读 ⇒ 409 CREDENTIAL_READONLY，文档�
 	assert.equal(status, 409)
 	assert.equal(body.code, 'CREDENTIAL_READONLY')
 	assert.deepEqual(credentials.calls.set, [])
-	assert.deepEqual(readConfigDocument(configPath()).doc.sources, [{ id: 's1', kind: 'tavily', mode: 'literal', ref: 'WEB_SEARCH_TAVILY_1' }])
+	assert.deepEqual(readConfigDocument(configPath()).doc.sources, [{ id: 's1', kind: 'tavily', keys: [{ id: 's1', mode: 'literal', ref: 'WEB_SEARCH_TAVILY_1' }] }])
 })
 
 await test('POST 明文但凭据服务不可用 ⇒ 500 CREDENTIAL_FAILED，文档未写', async () => {
@@ -318,8 +325,8 @@ await test('POST yuanbao：落盘含 secretId + budget，GET 回来带额度状�
 	assert.equal(status, 200)
 	assert.equal(body.ok, true)
 	const doc = readConfigDocument(configPath()).doc
-	assert.deepEqual(doc.sources[0].secretId, 'AKIDtestSecretId0000000000000000')
-	assert.deepEqual(doc.sources[0].budget, YUANBAO_SUBMISSION.budget)
+	assert.deepEqual(doc.sources[0].keys[0].secretId, 'AKIDtestSecretId0000000000000000')
+	assert.deepEqual(doc.sources[0].keys[0].budget, YUANBAO_SUBMISSION.budget)
 	const state = flattenState(await readState(ctx))
 	const source = state.sources[0]
 	assert.equal(source.usage.used, 0)
@@ -336,7 +343,7 @@ await test('POST yuanbao：SecretId 可更换（改一次就覆盖，不留旧�
 	const next = { ...YUANBAO_SUBMISSION, secretId: 'AKIDanotherSecretId000000000000000000' }
 	const { status } = await readResponse(await post({ sources: [next] }, ctx))
 	assert.equal(status, 200)
-	assert.equal(readConfigDocument(configPath()).doc.sources[0].secretId, 'AKIDanotherSecretId000000000000000000')
+	assert.equal(readConfigDocument(configPath()).doc.sources[0].keys[0].secretId, 'AKIDanotherSecretId000000000000000000')
 })
 
 await test('POST yuanbao 缺 SecretId ⇒ 400 INVALID_SECRET_ID，且一个字都不写', async () => {
@@ -384,7 +391,7 @@ await test('POST：手动停用写进文档（源还在，只是 disabled: true�
 	const disabled = { ...YUANBAO_SUBMISSION, disabled: true }
 	const { status, body } = await readResponse(await post({ sources: [disabled] }, ctx))
 	assert.equal(status, 200)
-	assert.equal(readConfigDocument(configPath()).doc.sources[0].disabled, true, '停用必须落盘（不是删除）')
+	assert.equal(readConfigDocument(configPath()).doc.sources[0].keys[0].disabled, true, '停用必须落盘（不是删除）')
 	assert.equal(readConfigDocument(configPath()).doc.sources.length, 1)
 	assert.equal(body.sources[0].disabled, true)
 	assert.equal(body.sources[0].secretId, YUANBAO_SUBMISSION.secretId, '停用不丢字段')
@@ -430,14 +437,14 @@ await test('POST queryUsage：查上游 Tavily /usage（GET + Bearer），非 Ta
 		)
 	}
 	try {
-		const { status, body } = await readResponse(await post({ queryUsage: ['s1', 's2', 'nope'] }, ctx))
+		const { status, body } = await readResponse(await post({ queryUsage: ['k1', 'k2', 'nope'] }, ctx))
 		assert.equal(status, 200)
 		assert.equal(seen.url, 'https://api.tavily.com/usage')
 		assert.equal(seen.init.method, 'GET')
 		assert.equal(seen.init.headers.authorization, 'Bearer tvly-1')
-		assert.deepEqual(body.results.s1, { ok: true, plan: 'Researcher', planUsage: 1000, planLimit: 1000, keyUsage: 1000, keyLimit: null, searchUsage: 1000 })
-		assert.deepEqual(body.results.s2, { ok: false, error: 'unsupported-kind' })
-		assert.deepEqual(body.results.nope, { ok: false, error: 'unknown-source' })
+		assert.deepEqual(body.results.k1, { ok: true, source: 's1', plan: 'Researcher', planUsage: 1000, planLimit: 1000, keyUsage: 1000, keyLimit: null, searchUsage: 1000 })
+		assert.deepEqual(body.results.k2, { ok: false, error: 'unsupported-kind' })
+		assert.deepEqual(body.results.nope, { ok: false, error: 'unknown-key' })
 	} finally {
 		globalThis.fetch = realFetch
 	}
@@ -453,8 +460,8 @@ await test('POST queryUsage：缺凭据 / 上游报错 / 超时 都归一化成 
 		throw Object.assign(new Error('timed out'), { name: 'TimeoutError' })
 	}
 	try {
-		const { body } = await readResponse(await post({ queryUsage: ['s1'] }, ctx))
-		assert.deepEqual(body.results.s1, { ok: false, error: 'credential-missing' })
+		const { body } = await readResponse(await post({ queryUsage: ['k1'] }, ctx))
+		assert.deepEqual(body.results.k1, { ok: false, error: 'credential-missing' })
 	} finally {
 		globalThis.fetch = realFetch
 	}
@@ -473,7 +480,7 @@ await test('配置文件被占成目录时 readConfigDocument 也不抛（防呆
 	try {
 		const result = readConfigDocument(configPath())
 		assert.ok(typeof result.error === 'string' && result.error.length > 0, String(result.error))
-		assert.equal(result.doc.sources.length, 2, '读不了就退默认文档')
+		assert.equal(result.doc.sources.length, 1, '读不了就退默认文档')
 	} finally {
 		cleanup(configPath())
 	}
