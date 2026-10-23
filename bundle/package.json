@@ -1,10 +1,10 @@
 {
   "name": "dsh-websearch-tavily-keys-select",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "type": "module",
   "main": "./host/index-v5.mjs",
   "icon": "./icon.svg",
-  "description": "DSH 的 Web 搜索链路：按顺序尝试最多 3 个 Tavily 源（Windows 环境变量或明文密钥）→ 全部失败时交给官方 DeepSeek 搜索兜底；配置卡片在侧栏 Plugins 的本包页面。",
+  "description": "DSH 的 Web 搜索链路：源 → key → 额度 三级模型。一个源可放多把 key（每把独立额度、可单独启停/删除），源有自己的计费方式；key 额度用完自动换同源下一把，整源不可用再换下一个源。内置腾讯元宝搜索（SearchPro，额度闸门 + Freshness/Site 意图解析）、Tavily（credits 记账 + 查额度）、DeepSeek 搜索 API。",
   "publishConfig": {
     "access": "public"
   },
@@ -25,7 +25,7 @@
     }
   },
   "dependencies": {
-    "dsh-search-chain": "^2.0.0",
+    "dsh-search-chain": "^3.0.0",
     "dsh-search-deepseek": "^1.0.0"
   },
   "keywords": [
@@ -36,7 +36,9 @@
     "plugin",
     "web-search",
     "search",
-    "tavily"
+    "tavily",
+    "yuanbao",
+    "tencent-cloud"
   ],
   "license": "MIT",
   "author": {
