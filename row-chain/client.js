@@ -95,6 +95,8 @@ window.__ModuleLoader__.load({
 			sourceExhausted: "本源的 key 额度都已用完 ⇒ 自动换下一个源",
 			sourceDisabled: "本源已停用（key 保留、不参与搜索）",
 			spendLine: (spend) => `本月约 ¥${spend}`,
+			sourceCardTitle: (id, label) => `源 ${id} · ${label}`,
+			removeGroup: "删除源",
 				usageUnlimited: (used) => `本月已用 ${used} 次（未设上限）`,
 				usageLineCredits: (used, monthly, remaining) => `本月已用 ${used} / ${monthly} credits · 还剩 ${remaining}`,
 				usageUnlimitedCredits: (used) => `本月已用 ${used} credits（未设上限）`,
@@ -165,6 +167,8 @@ window.__ModuleLoader__.load({
 			sourceExhausted: "All keys of this source are exhausted — the chain moves on",
 			sourceDisabled: "This source is disabled (keys kept, not used)",
 			spendLine: (spend) => `≈ ¥${spend} this month`,
+			sourceCardTitle: (id, label) => `Source ${id} · ${label}`,
+			removeGroup: "Delete source",
 				usageUnlimited: (used) => `${used} calls used this month (no cap)`,
 				usageLineCredits: (used, monthly, remaining) => `${used} / ${monthly} credits used this month · ${remaining} left`,
 				usageUnlimitedCredits: (used) => `${used} credits used this month (no cap)`,
@@ -238,7 +242,8 @@ window.__ModuleLoader__.load({
 			return { status: "loading", error: null, state: null, draft: null, saving: false, notice: null };
 		}
 		/**
-		 * 数字输入 → 非负整数；空串/非数字 → null（`null` 与 0 必须分得开：
+		 * 数字输入 → 非负整数；空串/非数字 → null（
+ull` 与 0 必须分得开：
 		 * 空额度表示"用默认值"，额度 0 表示"不限"）。
 		 */
 		function toInteger(value) {
@@ -339,6 +344,16 @@ window.__ModuleLoader__.load({
 		function markRestoreAuto(draft, index) {
 			return patchSource(draft, index, { restoreAuto: true });
 		}
+		/** 删除**整个源**（连同它下面所有 key 的行）——判据是渲染时用的 groupKey。 */
+		function removeGroup(draft, groupKey) {
+			if (typeof groupKey !== "string" || groupKey.length === 0) return draft;
+			return {
+				sources: draft.sources.filter((row, at) => {
+					const key = typeof row.sourceId === "string" && row.sourceId.length > 0 ? row.sourceId : `__new-${at}`;
+					return key !== groupKey;
+				}),
+			};
+		}
 		function removeSource(draft, index) {
 			return { sources: draft.sources.filter((_, at) => at !== index) };
 		}
@@ -402,7 +417,8 @@ window.__ModuleLoader__.load({
 		}
 		/**
 		 * 草稿里的额度 → 提交用的预算对象。
-		 * 空输入 = `null`（**不带这个字段** ⇒ 服务端用模板默认额度）；
+		 * 空输入 = 
+ull`（**不带这个字段** ⇒ 服务端用模板默认额度）；
 		 * 活动额度 `promo` 原样带回，避免"改一下每月额度就把活动额度弄丢"。
 		 */
 		function budgetOf(source) {
@@ -649,6 +665,9 @@ window.__ModuleLoader__.load({
 					case "remove":
 						shell.draft = removeSource(current, action.index);
 						break;
+					case "removeGroup":
+						shell.draft = removeGroup(current, action.groupKey);
+						break;
 					case "add":
 						shell.draft = addSource(current, shell.state?.templates ?? [], action.value, shell.state);
 						break;
@@ -674,6 +693,8 @@ window.__ModuleLoader__.load({
 		const S = {
 			intro: { color: TOKEN.tertiary, fontSize: 13, margin: "0 0 10px" },
 			card: { display: "flex", flexDirection: "column", gap: 10, maxWidth: 760 },
+			sourceCard: { border: `0.5px solid ${TOKEN.border}`, borderRadius: 10, padding: "12px 14px", display: "flex", flexDirection: "column", gap: 8 },
+			sourceTitle: { color: TOKEN.label, fontSize: 14, fontWeight: 600 },
 			row: { border: `0.5px solid ${TOKEN.border}`, borderRadius: 8, padding: "10px 12px", display: "flex", flexDirection: "column", gap: 6 },
 			rowHead: { display: "flex", alignItems: "center", justifyContent: "space-between" },
 			rowTitle: { color: TOKEN.label, fontSize: 13 },
@@ -705,7 +726,8 @@ window.__ModuleLoader__.load({
 				],
 			});
 		}
-		/** 自包含文本输入（`type` 可传 `password` / `number`）。 */
+		/** 自包含文本输入（`type` 可传 `password` / 
+umber`）。 */
 		function AtomInput(props) {
 			return jsx("input", {
 				type: props.type ?? "text",
@@ -851,12 +873,80 @@ window.__ModuleLoader__.load({
 		 * 一把 key 的渲染（2026-10-23 三级模型：源 → key）。
 		 * 标题行带上「所属源 / 第几把 key / 计费单位」，并给「＋ 加一把 key」与「删除这把 key」。
 		 */
+		/**
+		 * 按**源**把扁平的行分组（源 → keys）。
+		 * 草稿仍是"每把 key 一行"（逻辑简单），渲染时才折叠成"一个源一张卡、卡内 N 行 key"。
+		 */
+		function groupRows(draft) {
+			const groups = []
+			const index = new Map()
+			for (const [at, row] of (draft?.sources ?? []).entries()) {
+				const groupKey = typeof row.sourceId === "string" && row.sourceId.length > 0 ? row.sourceId : `__new-${at}`
+				let group = index.get(groupKey)
+				if (group === undefined) {
+					group = {
+						groupKey,
+						sourceId: typeof row.sourceId === "string" && row.sourceId.length > 0 ? row.sourceId : null,
+						kind: row.kind,
+						unit: row.unit,
+						sourceDisabled: row.sourceDisabled === true,
+						sourceExhausted: row.sourceExhausted === true,
+						sourceAvailable: row.sourceAvailable !== false,
+						indices: [],
+						rows: [],
+					}
+					index.set(groupKey, group)
+					groups.push(group)
+				}
+				group.indices.push(at)
+				group.rows.push(row)
+			}
+			return groups
+		}
+		/**
+		 * 一张**源卡**：源标题 + 源级动作（加 key / 删除源）+ 源级状态与汇总，卡内是各把 key 的行。
+		 */
+		function renderSourceCard(group, templates, props) {
+			const template = (templates ?? []).find((candidate) => candidate.kind === group.kind)
+			const unitLabel = group.unit === "credits" ? "credits" : "次"
+			const used = group.rows.reduce((total, row) => total + (Number.isInteger(row.usage?.used) ? row.usage.used : 0), 0)
+			const spend = group.rows.reduce((total, row) => total + (typeof row.usage?.spend === "number" ? row.usage.spend : 0), 0)
+			const price = group.rows.find((row) => typeof row.pricePer1000 === "number")?.pricePer1000 ?? null
+			const summary = price === null ? `${used} ${unitLabel}` : `${used} ${unitLabel} ≈ ¥${Math.round(spend * 10000) / 10000}`
+			return jsxs(
+				"div",
+				{
+					style: group.sourceDisabled === true ? { ...S.sourceCard, opacity: 0.7 } : S.sourceCard,
+					children: [
+						jsxs("div", {
+							style: S.rowHead,
+							children: [
+								jsx("span", { style: S.sourceTitle, children: `${copy.sourceCardTitle(group.sourceId ?? "新", template?.label ?? group.kind)}` }),
+								jsx(AtomTag, { children: copy.keysInSource(group.rows.length) }),
+								jsx(AtomTag, { children: `${copy.usedLabel} ${summary}` }),
+								jsx("span", { style: { flex: 1 } }),
+								jsx(AtomButton, {
+									children: copy.addKey,
+									disabled: group.rows.length >= maxKeysOf(props?.state),
+									onClick: () => props.edit({ kind: "addKey", index: group.indices.at(-1) }),
+								}),
+								jsx(AtomButton, { children: copy.removeGroup, onClick: () => props.edit({ kind: "removeGroup", groupKey: group.groupKey }) }),
+							],
+						}),
+						group.sourceDisabled === true ? jsx("p", { style: S.hint, children: copy.sourceDisabled }, `src-disabled-${group.groupKey}`) : null,
+						group.sourceExhausted === true ? jsx("p", { style: S.hint, children: copy.sourceExhausted }, `src-exhausted-${group.groupKey}`) : null,
+						...group.rows.map((row, offset) => renderSourceRow(row, group.indices[offset], templates, props)),
+					],
+				},
+				`source-card-${group.groupKey}`,
+			)
+		}
+		/** 一把 key 的行（源卡内部）：启用 / 删除 / 模式 / 变量名或明文 / 额度 / 查额度。 */
 		function renderSourceRow(source, index, templates, props) {
 			const kind = source.kind;
 			const template = (templates ?? []).find((candidate) => candidate.kind === kind);
 			const keyOrdinal = (props?.keyOrdinals?.[index] ?? 0) + 1;
-			const title = `${copy.keyOf(keyOrdinal - 1)} · ${copy.template}: ${template?.label ?? kind}`;
-			const unitLabel = source.unit === "credits" ? "credits" : "次";
+			const title = copy.keyOf(keyOrdinal - 1);
 			const isEnv = source.mode === "env";
 			const storedRef = source.serverMode === "literal" && typeof source.ref === "string" && source.ref.length > 0;
 			const autoDisabled = source.autoDisabled ?? null;
@@ -877,17 +967,11 @@ window.__ModuleLoader__.load({
 									onChange: (value) => props.edit({ kind: "toggleDisabled", index, value }),
 								}),
 								jsx("span", { style: S.rowTitle, children: title }),
-								jsx(AtomTag, { children: `${copy.sourceOf(source.sourceId ?? "新")} · ${unitLabel}` }),
-								jsx(AtomButton, { children: copy.addKey, onClick: () => props.edit({ kind: "addKey", index }) }),
+								jsx(AtomTag, { children: source.mode === "env" ? String(source.ref ?? "—") : copy.modeLiteral }),
+								jsx("span", { style: { flex: 1 } }),
 								jsx(AtomButton, { children: copy.remove, onClick: () => props.edit({ kind: "remove", index }) }),
 							],
 						}),
-						source.sourceExhausted === true
-							? jsx("p", { style: S.hint, children: copy.sourceExhausted }, `src-exhausted-${index}`)
-							: null,
-						source.sourceDisabled === true
-							? jsx("p", { style: S.hint, children: copy.sourceDisabled }, `src-disabled-${index}`)
-							: null,
 						source.disabled === true ? jsx("p", { style: S.hint, children: copy.disabledTag }, `disabled-${index}`) : null,
 						autoDisabled !== null
 							? jsxs(
@@ -987,7 +1071,9 @@ window.__ModuleLoader__.load({
 				keyOrdinals[index] = ordinal;
 				seen.set(groupKey, ordinal + 1);
 			}
-			const rowProps = { ...props, keyOrdinals };
+			const rowProps = { ...props, keyOrdinals, state };
+			// 一个源一张卡：卡内按 key 顺序排（Tavily 的两把 key 会在同一张卡里）
+			const groups = groupRows(draft);
 			return jsxs("div", {
 				style: S.card,
 				children: [
@@ -995,7 +1081,7 @@ window.__ModuleLoader__.load({
 					typeof state?.configError === "string" && state.configError.length > 0
 						? jsx("p", { style: S.banner, children: `${copy.configBroken}${state.configError}` })
 						: null,
-					...draft.sources.map((source, index) => renderSourceRow(source, index, templates, rowProps)),
+					...groups.map((group) => renderSourceCard(group, templates, rowProps)),
 					jsx("div", {
 						style: { display: "flex", gap: 8, flexWrap: "wrap" },
 						children: (templates.length > 0 ? templates : [{ kind: "tavily", label: "Tavily Key" }]).map((template) =>
@@ -1228,7 +1314,10 @@ window.__ModuleLoader__.load({
 			summaryText,
 			maxKeysOf,
 			addKey,
+			removeGroup,
+			groupRows,
 			renderSourceRow,
+			renderSourceCard,
 			applyEdit,
 			loadState,
 			saveDraft,

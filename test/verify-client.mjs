@@ -309,6 +309,24 @@ check('removeSource：按下标删掉那一把 key，其它行顺序不变', (()
 	return next.sources.length === 2 && next.sources[0].keyId === 'k2' && next.sources[1].keyId === 'k3'
 })())
 
+check('groupRows：一个源一张卡（s1 一张、s2 一张，卡内 1/2 把 key）', (() => {
+	const groups = I.groupRows(draft)
+	return groups.length === 2 &&
+		eq(groups.map((group) => [group.sourceId, group.rows.length]), [['s1', 1], ['s2', 2]]) &&
+		eq(groups[1].rows.map((row) => row.keyId), ['k2', 'k3'])
+})())
+check('removeGroup：删除整个源（s2 的两把 key 一起消失，s1 不受影响）', (() => {
+	const next = I.removeGroup(draft, 's2')
+	return next.sources.length === 1 && next.sources[0].keyId === 'k1'
+})())
+check('渲染：Tavily 是一张卡里两把 key（而不是两张卡各一把）', (() => {
+	// 直接把源卡渲染成节点，数一下卡内的 key 行
+	const groups = I.groupRows(draft)
+	const tree = expandAll(I.renderSourceCard(groups[1], SERVER_STATE.templates, { edit: () => {}, queryUsage: () => {}, state: SERVER_STATE, keyOrdinals: { 1: 0, 2: 1 } }))
+	const text = JSON.stringify(tree)
+	return text.includes('源 s2') && text.includes('本源共 2 把 key') && text.includes('TAVILY_API_KEY2') && text.includes('密钥 2')
+})())
+
 check('toRequest：按 sourceId 分组还原三级结构（同一源的两把 key 合成一个源）', (() => {
 	const req = I.toRequest(draft)
 	return eq(req.sources.map((s) => [s.id, s.kind, s.keys.length]), [['s1', 'yuanbao', 1], ['s2', 'tavily', 2]]) &&
