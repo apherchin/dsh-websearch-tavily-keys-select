@@ -3,6 +3,21 @@ import { MAX_SOURCES, defaultDocument, emptyDocument, validateSubmission, nextId
 
 console.log('-- core: 提交校验 --')
 
+/**
+ * 测试用适配器：把三级结构的 sources **拍平**回 v2 形状（每个源只有一把 key 时）。
+ * 断言仍然按 v2 写，产品侧依旧是源 → key。
+ */
+const flat = (sources) => sources.map((source) => {
+	const one = source.keys?.length === 1 ? source.keys[0] : undefined
+	if (one === undefined) return { id: source.id, kind: source.kind, keys: source.keys }
+	const row = { id: source.id, kind: source.kind, mode: one.mode, ref: one.ref }
+	if (one.secretId !== undefined) row.secretId = one.secretId
+	if (one.budget !== undefined) row.budget = one.budget
+	if (one.disabled === true) row.disabled = true
+	if (source.disabled === true) row.disabled = true
+	return row
+})
+
 const previous = defaultDocument()
 const env = (id, ref) => ({ id, kind: 'tavily', mode: 'env', ref })
 const literal = (id, secret) => ({ id, kind: 'tavily', mode: 'literal', ...(secret === undefined ? {} : { secret }) })
@@ -10,14 +25,14 @@ const literal = (id, secret) => ({ id, kind: 'tavily', mode: 'literal', ...(secr
 await test('合法提交：env 源原样通过，无 secret', () => {
 	const result = validateSubmission({ sources: [env('s1', 'TAVILY_API_KEY2')] }, previous)
 	assert.equal(result.ok, true)
-	assert.deepEqual(result.sources, [{ id: 's1', kind: 'tavily', mode: 'env', ref: 'TAVILY_API_KEY2' }])
+	assert.deepEqual(flat(result.sources), [{ id: 's1', kind: 'tavily', mode: 'env', ref: 'TAVILY_API_KEY2' }])
 	assert.deepEqual(result.secrets, [])
 })
 
 await test('空数组是合法提交（用户明确不要 Tavily 源）', () => {
 	const result = validateSubmission({ sources: [] }, previous)
 	assert.equal(result.ok, true)
-	assert.deepEqual(result.sources, [])
+	assert.deepEqual(flat(result.sources), [])
 })
 
 await test('请求体不是对象 / sources 不是数组 / 源不是对象 ⇒ INVALID_CONFIG', () => {
@@ -38,7 +53,7 @@ await test('disabled: true 可以提交（停用不是删除）；非布尔值 �
 	const ok = validateSubmission({ sources: [{ ...env('s1', 'K1'), disabled: true }] }, previous)
 	assert.equal(ok.ok, true)
 	assert.equal(ok.sources[0].disabled, true)
-	assert.equal(ok.sources[0].ref, 'K1', '停用不丢字段')
+	assert.equal(ok.sources[0].keys[0].ref, 'K1', '停用不丢字段')
 	const bad = validateSubmission({ sources: [{ ...env('s1', 'K1'), disabled: 'yes' }] }, previous)
 	assert.equal(bad.code, 'INVALID_CONFIG')
 })
@@ -70,31 +85,31 @@ await test('两个源同一个 ref ⇒ DUPLICATE_REF；同一个 id ⇒ DUPLICAT
 
 await test('id 缺省 ⇒ 自动分配未用的最小 sN', () => {
 	const result = validateSubmission({ sources: [env(undefined, 'K1'), env(undefined, 'K2'), env(undefined, 'K3')] }, emptyDocument())
-	assert.deepEqual(result.sources.map((source) => source.id), ['s1', 's2', 's3'])
+	assert.deepEqual(flat(result.sources).map((source) => source.id), ['s1', 's2', 's3'])
 })
 
 await test('literal 新源 ⇒ 拿到最小可用的 WEB_SEARCH_TAVILY_<n>，并带出 secret', () => {
 	const result = validateSubmission({ sources: [literal('s9', 'tvly-x')] }, emptyDocument())
 	assert.equal(result.ok, true)
-	assert.equal(result.sources[0].ref, 'WEB_SEARCH_TAVILY_1')
+	assert.equal(flat(result.sources)[0].ref, 'WEB_SEARCH_TAVILY_1')
 	assert.deepEqual(result.secrets, [{ id: 's9', ref: 'WEB_SEARCH_TAVILY_1', secret: 'tvly-x' }])
 })
 
 await test('literal 同 id 且旧文档也是 literal ⇒ 沿用旧 ref；不给 secret = 保持原密钥', () => {
 	const prior = { version: 1, sources: [{ id: 's1', kind: 'tavily', mode: 'literal', ref: 'WEB_SEARCH_TAVILY_3' }] }
 	const result = validateSubmission({ sources: [literal('s1')] }, prior)
-	assert.equal(result.sources[0].ref, 'WEB_SEARCH_TAVILY_3')
+	assert.equal(flat(result.sources)[0].ref, 'WEB_SEARCH_TAVILY_3')
 	assert.deepEqual(result.secrets, [])
 })
 
 await test('同 id 但从 env 切到 literal ⇒ 拿新 ref（不许把环境变量名当存储位置）', () => {
 	const result = validateSubmission({ sources: [literal('s1', 'tvly-y')] }, previous)
-	assert.equal(result.sources[0].ref, 'WEB_SEARCH_TAVILY_1')
+	assert.equal(flat(result.sources)[0].ref, 'WEB_SEARCH_TAVILY_1')
 })
 
 await test('两个新 literal 源不会撞 ref', () => {
 	const result = validateSubmission({ sources: [literal('a', 'k1'), literal('b', 'k2')] }, emptyDocument())
-	assert.deepEqual(result.sources.map((source) => source.ref), ['WEB_SEARCH_TAVILY_1', 'WEB_SEARCH_TAVILY_2'])
+	assert.deepEqual(flat(result.sources).map((source) => source.ref), ['WEB_SEARCH_TAVILY_1', 'WEB_SEARCH_TAVILY_2'])
 })
 
 await test('literal secret 为空串 / 非字符串 / 超长 ⇒ INVALID_CONFIG', () => {
@@ -107,7 +122,7 @@ await test('literal secret 为空串 / 非字符串 / 超长 ⇒ INVALID_CONFIG'
 
 await test('env 源的 ref 两侧空白会被 trim（用户粘贴带空格不该失败）', () => {
 	const result = validateSubmission({ sources: [env('s1', '  TAVILY_API_KEY2  ')] }, previous)
-	assert.equal(result.sources[0].ref, 'TAVILY_API_KEY2')
+	assert.equal(flat(result.sources)[0].ref, 'TAVILY_API_KEY2')
 })
 
 await test('nextIdIn / nextRefIn：取最小未用，且互不干扰', () => {
@@ -142,8 +157,8 @@ await test('yuanbao 源：secretId 两侧空白被 trim，budget 原样归一化
 		emptyDocument(),
 	)
 	assert.equal(result.ok, true)
-	assert.equal(result.sources[0].secretId, 'AKIDtestSecretId0000000000000000')
-	assert.deepEqual(result.sources[0].budget, { monthly: 6000, reserve: 300, promo: { monthly: 6000, until: '2026-11-30' } })
+	assert.equal(flat(result.sources)[0].secretId, 'AKIDtestSecretId0000000000000000')
+	assert.deepEqual(flat(result.sources)[0].budget, { monthly: 6000, reserve: 300, promo: { monthly: 6000, until: '2026-11-30' } })
 })
 
 await test('yuanbao 源：budget 非法 → INVALID_BUDGET（不做静默 clamp）', () => {
@@ -160,16 +175,16 @@ await test('yuanbao 源：budget 非法 → INVALID_BUDGET（不做静默 clamp�
 await test('tavily 源：即使请求里带了 secretId / budget 也不会被写进文档（形状收紧）', () => {
 	const result = validateSubmission({ sources: [{ kind: 'tavily', mode: 'env', ref: 'K1', secretId: 'AKIDxxxx', budget: { monthly: 5 } }] }, emptyDocument())
 	assert.equal(result.ok, true)
-	assert.equal('secretId' in result.sources[0], false)
+	assert.equal('secretId' in flat(result.sources)[0], false)
 	// budget 是通用能力（Tavily 也可以限流），所以这里允许带
-	assert.deepEqual(result.sources[0].budget, { monthly: 5, reserve: 0 })
+	assert.deepEqual(flat(result.sources)[0].budget, { monthly: 5, reserve: 0 })
 })
 
 await test('yuanbao + 明文：沿用旧 literal ref、密钥进 secrets（与 tavily 同一套凭据域）', () => {
 	const prior = { version: 2, sources: [{ id: 's1', kind: 'tavily', mode: 'literal', ref: 'WEB_SEARCH_TAVILY_2' }] }
 	const result = validateSubmission({ sources: [{ id: 's1', kind: 'yuanbao', mode: 'literal', secretId: 'AKIDxxxxxxxx', secret: 'sk-tencent' }] }, prior)
 	assert.equal(result.ok, true)
-	assert.equal(result.sources[0].ref, 'WEB_SEARCH_TAVILY_2')
+	assert.equal(flat(result.sources)[0].ref, 'WEB_SEARCH_TAVILY_2')
 	assert.deepEqual(result.secrets, [{ id: 's1', ref: 'WEB_SEARCH_TAVILY_2', secret: 'sk-tencent' }])
 })
 

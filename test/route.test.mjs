@@ -15,8 +15,41 @@ __resetFallbackRegistryForTests()
 
 console.log('-- route: 配置路由 --')
 
-const post = (body, ctx) => routeFetch(ctx, { method: 'POST', json: async () => body })
-const get = (ctx) => routeFetch(ctx, { method: 'GET' })
+
+/**
+ * 测试用适配器：把 GET/POST 响应里的 **三级源列表** 拍平回 v2 形状（源只有一把 key 时）。
+ * 产品侧结构不变；这样按"源上直接挂 mode/ref/budget/usage"写的断言继续有效。
+ */
+const flattenSource = (source) => {
+	const one = source.keys?.length === 1 ? source.keys[0] : undefined
+	if (one === undefined) return source
+	return {
+		...source,
+		mode: one.mode,
+		ref: one.ref,
+		...(one.secretId === undefined ? {} : { secretId: one.secretId }),
+		budget: one.budget ?? null,
+		credential: one.credential,
+		usage: one.usage,
+		autoDisabled: one.autoDisabled ?? null,
+		disabled: source.disabled === true || one.disabled === true,
+	}
+}
+const flattenState = (payload) =>
+	payload !== null && typeof payload === 'object' && Array.isArray(payload.sources)
+		? { ...payload, sources: payload.sources.map(flattenSource) }
+		: payload
+
+const post = async (body, ctx) => {
+	const response = await routeFetch(ctx, { method: 'POST', json: async () => body })
+	const payload = await response.json()
+	return { status: response.status, json: async () => flattenState(payload) }
+}
+const get = async (ctx) => {
+	const response = await routeFetch(ctx, { method: 'GET' })
+	const payload = await response.json()
+	return { status: response.status, json: async () => flattenState(payload) }
+}
 
 await test('路由常量 = /api/web-search-chain.config（路径段合法：^[A-Za-z0-9_$.-]+$）', () => {
 	assert.equal(CONFIG_PATH, '/api/web-search-chain.config')
@@ -264,7 +297,7 @@ await test('文档写失败 ⇒ 500 CONFIG_WRITE_FAILED（把路径占成目录�
 
 await test('readState 直接可用（界面首次加载走的就是它）', async () => {
 	const ctx = makeFakeCtx({ credentials: makeFakeCredentials(), connection: makeFakeConnection() })
-	const state = await readState(ctx)
+	const state = flattenState(await readState(ctx))
 	assert.equal(state.ok, true)
 	assert.equal(Array.isArray(state.sources), true)
 })
@@ -287,7 +320,7 @@ await test('POST yuanbao：落盘含 secretId + budget，GET 回来带额度状�
 	const doc = readConfigDocument(configPath()).doc
 	assert.deepEqual(doc.sources[0].secretId, 'AKIDtestSecretId0000000000000000')
 	assert.deepEqual(doc.sources[0].budget, YUANBAO_SUBMISSION.budget)
-	const state = await readState(ctx)
+	const state = flattenState(await readState(ctx))
 	const source = state.sources[0]
 	assert.equal(source.usage.used, 0)
 	assert.equal(source.usage.monthly, 6000, '活动期内生效额度是 6000')

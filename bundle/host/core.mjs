@@ -618,7 +618,8 @@ export function validateSubmission(body, previousDoc) {
 
 	const previousKeysById = new Map()
 	for (const source of previousDoc?.sources ?? []) {
-		for (const key of source.keys ?? []) previousKeysById.set(key.id, key)
+		// v2 旧文档没有 keys：源本身就是那把 key
+		for (const key of source.keys ?? [{ id: source.id, mode: source.mode, ref: source.ref }]) previousKeysById.set(key.id, key)
 	}
 	const sources = []
 	const secrets = []
@@ -631,7 +632,7 @@ export function validateSubmission(body, previousDoc) {
 		if (!isPlainObject(raw)) return failure('INVALID_CONFIG', `sources[${sourceIndex}] 必须是对象`, `sources[${sourceIndex}]`)
 		// 兼容 v2 提交形状（`mode`/`ref`/`budget` 直接挂在源上、没有 keys）：当成"一个源一把 key"。
 		// 界面已经改成三级模型，但手写 JSON / 老客户端不该因为形状旧而整单失败。
-		const legacy = raw.keys === undefined && (raw.mode === 'env' || raw.mode === 'literal')
+		const legacy = raw.keys === undefined && raw.mode !== undefined
 		const rawKeys = legacy
 			? [
 					{
@@ -679,7 +680,8 @@ export function validateSubmission(body, previousDoc) {
 		if (rawKeys.length > MAX_KEYS) return failure('TOO_MANY_KEYS', `每个源最多 ${MAX_KEYS} 个 key`, atSource('keys'))
 
 		for (const [keyIndex, rawKey] of rawKeys.entries()) {
-			const atKey = (name) => `sources[${sourceIndex}].keys[${keyIndex}].${name}`
+			// 兼容 v2 提交（一个源一把 key）时，field 仍指回 sources[i].xxx，老界面/老测试的定位不变
+			const atKey = (name) => (legacy ? `sources[${sourceIndex}].${name}` : `sources[${sourceIndex}].keys[${keyIndex}].${name}`)
 			if (!isPlainObject(rawKey)) return failure('INVALID_CONFIG', `keys[${keyIndex}] 必须是对象`, `sources[${sourceIndex}].keys[${keyIndex}]`)
 			if (rawKey.mode !== 'env' && rawKey.mode !== 'literal') {
 				return failure('INVALID_CONFIG', '模式必须是 "env" 或 "literal"', atKey('mode'))
