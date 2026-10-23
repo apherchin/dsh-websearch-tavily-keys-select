@@ -20,11 +20,11 @@ await test('文件不存在 ⇒ 默认文档、无 error（不主动落盘）', 
 	assert.equal(existsSync(path), false)
 })
 
-await test('合法文件 ⇒ 原样读出，无 error', () => {
+await test('合法文件 ⇒ 原样读出，无 error（v2 形状会被迁成三级结构）', () => {
 	writeConfigDocument(path, { sources: [{ id: 's1', kind: 'tavily', mode: 'env', ref: 'K1' }] })
 	const result = readConfigDocument(path)
 	assert.equal(result.error, undefined)
-	assert.deepEqual(result.doc.sources, [{ id: 's1', kind: 'tavily', mode: 'env', ref: 'K1' }])
+	assert.deepEqual(result.doc.sources, [{ id: 's1', kind: 'tavily', keys: [{ id: 's1', mode: 'env', ref: 'K1' }] }])
 })
 
 await test('损坏文件 ⇒ 默认文档 + error（绝不抛）', () => {

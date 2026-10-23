@@ -18,6 +18,17 @@
  * 四条都要能同时配在链里。上限只是防呆，不改变"按文档顺序尝试"的语义。
  */
 export const MAX_SOURCES = 4
+/**
+ * **每个源**最多几个 key（2026-10-23 三级模型：源 → key → 额度）。
+ *
+ * 例如 Tavily 一个"源"里放两把 key，各自 1000 credits/月，key1 用完自动换 key2，
+ * key2 也完了才轮到下一个源 —— 不用再把两把 key 拆成两个源。
+ */
+export const MAX_KEYS = 4
+/** 计费单位的合法取值：`calls`（按次）/ `credits`（按 credit，Tavily 用）。 */
+export const BILLING_UNITS = ['calls', 'credits']
+/** 各模板的**默认**计费单位（一个源就是一份账单，单位由它的计费方式决定）。 */
+export const DEFAULT_UNIT_BY_KIND = { yuanbao: 'calls', 'deepseek-api': 'calls', tavily: 'credits' }
 /** 配置文件体积上限：超过即视同损坏。 */
 export const MAX_DOCUMENT_BYTES = 65536
 /** 凭据引用名文法（与凭据域一致：POSIX shell 标识符）。 */
@@ -31,7 +42,7 @@ export const MAX_REF_LENGTH = 64
 /** 明文长度上限。 */
 export const MAX_SECRET_LENGTH = 1024
 /** 文档版本（形状变化时用它做迁移分支；v2 起有 secretId / budget）。 */
-export const DOCUMENT_VERSION = 2
+export const DOCUMENT_VERSION = 3
 
 /**
  * 腾讯云 SecretId 的形状校验。
@@ -79,11 +90,19 @@ function isPlainObject(value) {
  * 会不一致**（override 写进文件但没热生效）。所以不再据此推断用户意图，改成两条都播。
  */
 export function defaultDocument() {
+	// 默认播种「一个 Tavily 源 + 两把 key」= 三级模型（源 → key → 额度）的样例：
+	// key1 用完自动换 key2，两把都完了才轮到下一个源。
 	return {
 		version: DOCUMENT_VERSION,
 		sources: [
-			{ id: 's1', kind: 'tavily', mode: 'env', ref: 'TAVILY_API_KEY1' },
-			{ id: 's2', kind: 'tavily', mode: 'env', ref: 'TAVILY_API_KEY2' },
+			{
+				id: 's1',
+				kind: 'tavily',
+				keys: [
+					{ id: 'k1', mode: 'env', ref: 'TAVILY_API_KEY1' },
+					{ id: 'k2', mode: 'env', ref: 'TAVILY_API_KEY2' },
+				],
+			},
 		],
 	}
 }
@@ -164,9 +183,28 @@ export function normalizeBudget(raw) {
 	return budget
 }
 
-/** 源的有效预算：文档里写了的优先，否则取该模板的默认预算。 */
-export function effectiveBudget(source) {
-	if (source?.budget !== undefined) return source.budget
+/**
+ * 一个源的计费单位：文档里显式写的优先，否则按模板取默认（元宝/DS=按次，Tavily=按 credit）。
+ *
+ * **一个源就是一份账单**：它的所有 key 都按这个单位计量（所以额度闸门、显示、换算都用同一个单位）。
+ * @param source - 文档里的源（可带 `billing: {unit, pricePer1000?}`）。
+ */
+export function sourceUnit(source) {
+	const unit = source?.billing?.unit
+	if (BILLING_UNITS.includes(unit)) return unit
+	return DEFAULT_UNIT_BY_KIND[source?.kind] ?? 'calls'
+}
+
+/**
+ * 某个 key 的有效额度：key 上写了的优先，否则取该源模板的默认额度。
+ *
+ * 为什么默认值挂在 key 上而不是源上：额度是**按 key 单独结算**的（每个 key 一份账单），
+ * 源级数字只是它的汇总。
+ * @param source - 该 key 所属的源（提供 `kind`）。
+ * @param key - 该 key（可带 `budget`）。
+ */
+export function keyBudget(source, key) {
+	if (key?.budget !== undefined) return key.budget
 	return defaultBudgetFor(source?.kind)
 }
 
@@ -183,7 +221,16 @@ export function effectiveMonthly(budget, nowMs) {
 }
 
 /**
- * 一次搜索前要看的额度状态。
+ * **v2 形状的便利函数**：源上直接挂 `budget` 时的有效额度（等价于 `keyBudget(source, source)`）。
+ * 三级模型下额度挂在 key 上，新代码请用 `keyBudget(source, key)`。
+ */
+export function effectiveBudget(source) {
+	if (source?.budget !== undefined) return source.budget
+	return defaultBudgetFor(source?.kind)
+}
+
+/**
+ * 一次搜索前要看的额度状态（**针对单个 key**）。
  *
  * 语义要点：
  * 1. **`reserve` 是「不用的余量」**：可用 = monthly − reserve。
@@ -191,19 +238,20 @@ export function effectiveMonthly(budget, nowMs) {
  *    （Infinity 过不了 JSON，界面会拿到 null）。
  * 3. 判据是 `used >= 可用` ⇒ `exhausted`，**到点即停**（宁可在 1999 次停，也不要在 2001 次花 2.8 倍的钱）。
  *
- * @param source - 源（读它的 `budget` / `kind`）。
- * @param used - 本月已用次数。
+ * @param budget - **已解析好的**预算（`keyBudget(source, key)` 的结果；undefined = 不限）。
+ * @param used - 本月已用（单位由调用方决定：按次或按 credit）。
  * @param nowMs - 毫秒时间戳（测试注入用）。
  */
-export function budgetStatus(source, used, nowMs = Date.now()) {
-	const budget = effectiveBudget(source)
+export function budgetStatus(budget, used, nowMs = Date.now()) {
+	// 兼容：老调用方直接把"源"当第一个参数传进来（v2 形状）⇒ 就地解析它的额度
+	const resolved = budget !== undefined && budget.kind !== undefined && budget.monthly === undefined ? effectiveBudget(budget) : budget
 	const usedCount = Number.isInteger(used) && used >= 0 ? used : 0
-	if (budget === undefined || budget.monthly === 0) {
+	if (resolved === undefined || resolved.monthly === 0) {
 		return { unlimited: true, monthly: null, reserve: 0, used: usedCount, remaining: null, exhausted: false, promo: null }
 	}
-	const effective = effectiveMonthly(budget, nowMs)
+	const effective = effectiveMonthly(resolved, nowMs)
 	const monthly = effective.monthly
-	const reserve = Math.min(budget.reserve ?? 0, monthly)
+	const reserve = Math.min(resolved.reserve ?? 0, monthly)
 	const usable = Math.max(0, monthly - reserve)
 	return {
 		unlimited: false,
@@ -213,9 +261,9 @@ export function budgetStatus(source, used, nowMs = Date.now()) {
 		remaining: Math.max(0, usable - usedCount),
 		exhausted: usedCount >= usable,
 		promo:
-			budget.promo === undefined
+			resolved.promo === undefined
 				? null
-				: { monthly: budget.promo.monthly, until: budget.promo.until, active: effective.promoActive },
+				: { monthly: resolved.promo.monthly, until: resolved.promo.until, active: effective.promoActive },
 	}
 }
 //#endregion
@@ -352,8 +400,77 @@ export function withUsageCredits(doc, month, sourceId, value) {
 //#endregion
 
 /**
+ * 解析文档里一个 **key** 的形状（v3：额度挂在 key 上）。
+ * @returns `{key}` 或 `{error}`。
+ */
+function parseKeyRow(raw, kind, at) {
+	if (!isPlainObject(raw)) return { error: `${at} must be an object` }
+	if (typeof raw.id !== 'string' || !ID_PATTERN.test(raw.id)) return { error: `${at}.id is invalid` }
+	if (raw.mode !== 'env' && raw.mode !== 'literal') return { error: `${at}.mode must be "env" or "literal"` }
+	if (typeof raw.ref !== 'string' || raw.ref.length > MAX_REF_LENGTH || !REF_PATTERN.test(raw.ref)) {
+		return { error: `${at}.ref is invalid` }
+	}
+	const key = { id: raw.id, mode: raw.mode, ref: raw.ref }
+	if (kind === 'yuanbao') {
+		const secretId = typeof raw.secretId === 'string' ? raw.secretId.trim() : ''
+		if (!SECRET_ID_PATTERN.test(secretId)) return { error: `${at}.secretId is invalid` }
+		key.secretId = secretId
+	}
+	if (raw.budget !== undefined) {
+		const budget = normalizeBudget(raw.budget)
+		if (budget === undefined) return { error: `${at}.budget is invalid` }
+		key.budget = budget
+	}
+	if (raw.disabled !== undefined) {
+		if (typeof raw.disabled !== 'boolean') return { error: `${at}.disabled must be a boolean` }
+		if (raw.disabled) key.disabled = true
+	}
+	return { key }
+}
+
+/** 解析源的计费方式（`{unit, pricePer1000?}`）；非法返回 `{error}`。 */
+function parseBillingRow(raw, at) {
+	if (!isPlainObject(raw)) return { error: `${at} must be an object` }
+	const billing = {}
+	if (raw.unit !== undefined) {
+		if (!BILLING_UNITS.includes(raw.unit)) return { error: `${at}.unit must be one of ${BILLING_UNITS.join('/')}` }
+		billing.unit = raw.unit
+	}
+	if (raw.pricePer1000 !== undefined) {
+		if (typeof raw.pricePer1000 !== 'number' || !Number.isFinite(raw.pricePer1000) || raw.pricePer1000 < 0) {
+			return { error: `${at}.pricePer1000 must be a non-negative number` }
+		}
+		billing.pricePer1000 = raw.pricePer1000
+	}
+	return { billing: Object.keys(billing).length === 0 ? undefined : billing }
+}
+
+/**
+ * **v2 → v3 迁移**：v2 的每个源（一个源一把 key）变成一个「单 key 源」。
+ *
+ * 关键点：**key id 沿用旧源 id**（`s1`/`s2`…）⇒ 本地账本（按 id 计数）与运行时状态（按 id 记失败）
+ * 都不需要动，历史用量的对应关系原样保留。
+ *
+ * @param rawSources - v2 文档里的 `sources` 数组。
+ * @returns v3 形状的源数组（未做校验，交给后面的统一校验）。
+ */
+export function migrateV2Sources(rawSources) {
+	return rawSources.map((raw) => {
+		if (!isPlainObject(raw)) return raw
+		const key = { id: raw.id, mode: raw.mode, ref: raw.ref }
+		if (typeof raw.secretId === 'string') key.secretId = raw.secretId
+		if (raw.budget !== undefined) key.budget = raw.budget
+		if (raw.disabled === true) key.disabled = true
+		return { id: raw.id, kind: raw.kind, keys: [key] }
+	})
+}
+
+/**
  * 解析文档文本。**任何问题都返回 `{doc: 默认文档, error}`，绝不抛** ——
  * 搜索链路每次搜索都调这里，它抛错就等于 web_search 挂掉。
+ *
+ * v3 形状：`{version:3, sources:[{id, kind, label?, billing?, disabled?, keys:[{id, mode, ref, secretId?, budget?, disabled?}]}]}`；
+ * 读到 v2（源上直接挂 mode/ref/budget）会**自动迁移**，并把 key id 设成原来的源 id。
  */
 export function parseDocumentText(text) {
 	if (typeof text !== 'string') return { doc: defaultDocument(), error: 'configuration is not text' }
@@ -368,66 +485,78 @@ export function parseDocumentText(text) {
 	}
 	if (!isPlainObject(parsed)) return { doc: defaultDocument(), error: 'configuration must be a JSON object' }
 	if (!Array.isArray(parsed.sources)) return { doc: defaultDocument(), error: 'configuration.sources must be an array' }
-	if (parsed.sources.length > MAX_SOURCES) {
+	// v2 判定：显式 version===2，或（没有 version 且源上直接带 mode/ref 而没有 keys）
+	const isV2 = parsed.version === 2 || (parsed.version === undefined && parsed.sources.some((raw) => isPlainObject(raw) && raw.keys === undefined))
+	const rawSources = isV2 ? migrateV2Sources(parsed.sources) : parsed.sources
+	if (rawSources.length > MAX_SOURCES) {
 		return { doc: defaultDocument(), error: `configuration lists more than ${MAX_SOURCES} sources` }
 	}
 	const sources = []
-	for (const [index, raw] of parsed.sources.entries()) {
-		if (!isPlainObject(raw)) return { doc: defaultDocument(), error: `configuration.sources[${index}] must be an object` }
+	for (const [sourceIndex, raw] of rawSources.entries()) {
+		const atSource = `configuration.sources[${sourceIndex}]`
+		if (!isPlainObject(raw)) return { doc: defaultDocument(), error: `${atSource} must be an object` }
 		if (!TEMPLATES.some((template) => template.kind === raw.kind)) {
-			return { doc: defaultDocument(), error: `configuration.sources[${index}].kind is not a known template` }
-		}
-		if (raw.mode !== 'env' && raw.mode !== 'literal') {
-			return { doc: defaultDocument(), error: `configuration.sources[${index}].mode must be "env" or "literal"` }
+			return { doc: defaultDocument(), error: `${atSource}.kind is not a known template` }
 		}
 		if (typeof raw.id !== 'string' || !ID_PATTERN.test(raw.id)) {
-			return { doc: defaultDocument(), error: `configuration.sources[${index}].id is invalid` }
+			return { doc: defaultDocument(), error: `${atSource}.id is invalid` }
 		}
-		if (typeof raw.ref !== 'string' || raw.ref.length > MAX_REF_LENGTH || !REF_PATTERN.test(raw.ref)) {
-			return { doc: defaultDocument(), error: `configuration.sources[${index}].ref is invalid` }
+		if (!Array.isArray(raw.keys)) return { doc: defaultDocument(), error: `${atSource}.keys must be an array` }
+		if (raw.keys.length === 0) return { doc: defaultDocument(), error: `${atSource}.keys must not be empty` }
+		if (raw.keys.length > MAX_KEYS) return { doc: defaultDocument(), error: `${atSource}.keys lists more than ${MAX_KEYS} keys` }
+		const source = { id: raw.id, kind: raw.kind, keys: [] }
+		if (raw.label !== undefined) {
+			if (typeof raw.label !== 'string' || raw.label.length > 64) return { doc: defaultDocument(), error: `${atSource}.label is invalid` }
+			if (raw.label.length > 0) source.label = raw.label
 		}
-		const source = { id: raw.id, kind: raw.kind, mode: raw.mode, ref: raw.ref }
-		if (raw.kind === 'yuanbao') {
-			const secretId = typeof raw.secretId === 'string' ? raw.secretId.trim() : ''
-			if (!SECRET_ID_PATTERN.test(secretId)) {
-				return { doc: defaultDocument(), error: `configuration.sources[${index}].secretId is invalid` }
-			}
-			source.secretId = secretId
-		}
-		if (raw.budget !== undefined) {
-			const budget = normalizeBudget(raw.budget)
-			if (budget === undefined) {
-				return { doc: defaultDocument(), error: `configuration.sources[${index}].budget is invalid` }
-			}
-			source.budget = budget
+		if (raw.billing !== undefined) {
+			const parsedBilling = parseBillingRow(raw.billing, `${atSource}.billing`)
+			if (parsedBilling.error !== undefined) return { doc: defaultDocument(), error: parsedBilling.error }
+			if (parsedBilling.billing !== undefined) source.billing = parsedBilling.billing
 		}
 		if (raw.disabled !== undefined) {
-			// 手动停用：**用户的意图**，与运行时观察到的"自动停用"分开存（见 config-store 的 runtime state）
-			if (typeof raw.disabled !== 'boolean') {
-				return { doc: defaultDocument(), error: `configuration.sources[${index}].disabled must be a boolean` }
-			}
+			if (typeof raw.disabled !== 'boolean') return { doc: defaultDocument(), error: `${atSource}.disabled must be a boolean` }
 			if (raw.disabled) source.disabled = true
+		}
+		for (const [keyIndex, rawKey] of raw.keys.entries()) {
+			const parsedKey = parseKeyRow(rawKey, raw.kind, `${atSource}.keys[${keyIndex}]`)
+			if (parsedKey.error !== undefined) return { doc: defaultDocument(), error: parsedKey.error }
+			source.keys.push(parsedKey.key)
 		}
 		sources.push(source)
 	}
 	const ids = new Set()
+	const keyIds = new Set()
 	const refs = new Set()
 	for (const source of sources) {
 		if (ids.has(source.id)) return { doc: defaultDocument(), error: `configuration repeats source id ${JSON.stringify(source.id)}` }
-		if (refs.has(source.ref)) return { doc: defaultDocument(), error: `configuration repeats credential reference ${JSON.stringify(source.ref)}` }
 		ids.add(source.id)
-		refs.add(source.ref)
+		for (const key of source.keys) {
+			if (keyIds.has(key.id)) return { doc: defaultDocument(), error: `configuration repeats key id ${JSON.stringify(key.id)}` }
+			if (refs.has(key.ref)) return { doc: defaultDocument(), error: `configuration repeats credential reference ${JSON.stringify(key.ref)}` }
+			keyIds.add(key.id)
+			refs.add(key.ref)
+		}
 	}
 	return { doc: { version: DOCUMENT_VERSION, sources }, error: undefined }
 }
 
 /** 序列化文档：稳定 2 空格缩进 + 末尾一个换行（version 恒由本函数写死）。 */
 export function serializeDocument(doc) {
-	const sources = doc.sources.map((source) => {
-		const row = { id: source.id, kind: source.kind, mode: source.mode, ref: source.ref }
-		if (source.kind === 'yuanbao' && typeof source.secretId === 'string') row.secretId = source.secretId
-		if (source.budget !== undefined) row.budget = source.budget
+	// 容错：调用方若还递 v2 形状（源上直接挂 mode/ref），先迁成三级结构再写，绝不写坏文件
+	const list = (doc.sources ?? []).some((source) => !Array.isArray(source.keys)) ? migrateV2Sources(doc.sources ?? []) : doc.sources ?? []
+	const sources = list.map((source) => {
+		const row = { id: source.id, kind: source.kind }
+		if (typeof source.label === 'string' && source.label.length > 0) row.label = source.label
+		if (source.billing !== undefined) row.billing = source.billing
 		if (source.disabled === true) row.disabled = true
+		row.keys = source.keys.map((key) => {
+			const keyRow = { id: key.id, mode: key.mode, ref: key.ref }
+			if (source.kind === 'yuanbao' && typeof key.secretId === 'string') keyRow.secretId = key.secretId
+			if (key.budget !== undefined) keyRow.budget = key.budget
+			if (key.disabled === true) keyRow.disabled = true
+			return keyRow
+		})
 		return row
 	})
 	return `${JSON.stringify({ version: DOCUMENT_VERSION, sources }, null, 2)}\n`
@@ -442,9 +571,18 @@ export function nextIdIn(usedIds) {
 	return `s${Date.now()}`
 }
 
+/** 在 `usedIds` 之外取最小的 `kN`（key 的 id 在**整份文档**里唯一）。 */
+export function nextKeyIdIn(usedIds) {
+	for (let n = 1; n <= MAX_SOURCES * MAX_KEYS + 1; n += 1) {
+		const candidate = `k${n}`
+		if (!usedIds.has(candidate)) return candidate
+	}
+	return `k${Date.now()}`
+}
+
 /** 在 `usedRefs` 之外取最小的 `WEB_SEARCH_TAVILY_<n>`。 */
 export function nextRefIn(usedRefs) {
-	for (let n = 1; n <= MAX_SOURCES + 1; n += 1) {
+	for (let n = 1; n <= MAX_SOURCES * MAX_KEYS + 1; n += 1) {
 		const candidate = `${LITERAL_REF_PREFIX}${n}`
 		if (!usedRefs.has(candidate)) return candidate
 	}
@@ -457,16 +595,14 @@ function failure(code, message, field) {
 }
 
 /**
- * 校验一次提交并归一成「下一份文档」。
+ * 校验一次提交并归一成「下一份文档」（v3：源 → key → key 上的额度）。
  *
- * 四条要记住的语义：
- * 1. **源的身份是 `id` 而不是数组下标**：明文源的引用名按 id 沿用，增删别的源不会让它漂移
- *    （漂了就对不上已存的密钥）。
- * 2. **明文源的 `ref` 由服务端决定**（忽略请求里的值）：新源分配最小的
- *    `WEB_SEARCH_TAVILY_<n>`，避免撞名与伪造。
+ * 要点：
+ * 1. **id 决定身份**：源 id 在源之间唯一、key id 在**整份文档**里唯一；明文 key 的引用名按 key id 沿用，
+ *    增删别的源/键不会让它漂移（漂了就对不上已存的密钥）。
+ * 2. **明文 key 的 `ref` 由服务端决定**（忽略请求里的值）：新的分配最小 `WEB_SEARCH_TAVILY_<n>`，避免撞名与伪造。
  * 3. **全量校验在前**：任何一项不过就返回失败，调用方据此做到「一个字节都不写」。
- * 4. **yuanbao 源必须带 SecretId**（它是明文存配置、界面可改的那一半凭据）；
- *    预算可带可不带，带了就按 `normalizeBudget` 全量校验（不做静默 clamp）。
+ * 4. `yuanbao` 的 key 必须带 SecretId；额度挂在 key 上，带了就按 `normalizeBudget` 全量校验（不做静默 clamp）。
  *
  * @param body - POST 的 JSON 体。
  * @param previousDoc - 当前文档（沿用引用名用）。
@@ -480,95 +616,191 @@ export function validateSubmission(body, previousDoc) {
 		return failure('TOO_MANY_SOURCES', `最多只能有 ${MAX_SOURCES} 个搜索源`, 'sources')
 	}
 
-	const previousById = new Map(previousDoc.sources.map((source) => [source.id, source]))
+	const previousKeysById = new Map()
+	for (const source of previousDoc?.sources ?? []) {
+		for (const key of source.keys ?? []) previousKeysById.set(key.id, key)
+	}
 	const sources = []
 	const secrets = []
-	const usedIds = new Set()
+	const usedSourceIds = new Set()
+	const usedKeyIds = new Set()
 	const usedRefs = new Set()
 
-	for (const [index, raw] of rawSources.entries()) {
-		const at = (name) => `sources[${index}].${name}`
-		if (!isPlainObject(raw)) return failure('INVALID_CONFIG', `sources[${index}] 必须是对象`, `sources[${index}]`)
+	for (const [sourceIndex, raw] of rawSources.entries()) {
+		const atSource = (name) => `sources[${sourceIndex}].${name}`
+		if (!isPlainObject(raw)) return failure('INVALID_CONFIG', `sources[${sourceIndex}] 必须是对象`, `sources[${sourceIndex}]`)
+		// 兼容 v2 提交形状（`mode`/`ref`/`budget` 直接挂在源上、没有 keys）：当成"一个源一把 key"。
+		// 界面已经改成三级模型，但手写 JSON / 老客户端不该因为形状旧而整单失败。
+		const legacy = raw.keys === undefined && (raw.mode === 'env' || raw.mode === 'literal')
+		const rawKeys = legacy
+			? [
+					{
+						id: raw.id,
+						mode: raw.mode,
+						ref: raw.ref,
+						secret: raw.secret,
+						secretId: raw.secretId,
+						budget: raw.budget,
+						disabled: raw.disabled,
+					},
+				]
+			: raw.keys
 		if (!TEMPLATES.some((template) => template.kind === raw.kind)) {
-			return failure('UNKNOWN_KIND', `不支持的模板 ${JSON.stringify(raw.kind)}`, at('kind'))
-		}
-		if (raw.mode !== 'env' && raw.mode !== 'literal') {
-			return failure('INVALID_CONFIG', '模式必须是 "env" 或 "literal"', at('mode'))
+			return failure('UNKNOWN_KIND', `不支持的模板 ${JSON.stringify(raw.kind)}`, atSource('kind'))
 		}
 
-		let id = raw.id
-		if (id !== undefined) {
-			if (typeof id !== 'string' || !ID_PATTERN.test(id)) return failure('INVALID_CONFIG', '源 id 非法', at('id'))
-			if (usedIds.has(id)) return failure('DUPLICATE_ID', `源 id ${JSON.stringify(id)} 重复`, at('id'))
+		let sourceId = raw.id
+		if (sourceId !== undefined) {
+			if (typeof sourceId !== 'string' || !ID_PATTERN.test(sourceId)) return failure('INVALID_CONFIG', '源 id 非法', atSource('id'))
+			if (usedSourceIds.has(sourceId)) return failure('DUPLICATE_ID', `源 id ${JSON.stringify(sourceId)} 重复`, atSource('id'))
 		} else {
-			id = nextIdIn(usedIds)
+			sourceId = nextIdIn(usedSourceIds)
 		}
-		usedIds.add(id)
+		usedSourceIds.add(sourceId)
 
-		const row = { id, kind: raw.kind, mode: raw.mode, ref: undefined }
-		if (raw.kind === 'yuanbao') {
-			const secretId = typeof raw.secretId === 'string' ? raw.secretId.trim() : ''
-			if (!SECRET_ID_PATTERN.test(secretId)) {
-				return failure('INVALID_SECRET_ID', 'SecretId 必填，形如 AKID… 的腾讯云 API 密钥', at('secretId'))
-			}
-			row.secretId = secretId
+		const source = { id: sourceId, kind: raw.kind, keys: [] }
+		if (raw.label !== undefined) {
+			if (typeof raw.label !== 'string' || raw.label.length > 64) return failure('INVALID_CONFIG', 'label 必须是 ≤64 字符的字符串', atSource('label'))
+			if (raw.label.length > 0) source.label = raw.label
 		}
-		if (raw.budget !== undefined) {
-			const budget = normalizeBudget(raw.budget)
-			if (budget === undefined) {
-				return failure('INVALID_BUDGET', '额度必须是 {monthly, reserve} 非负整数（reserve ≤ monthly；monthly=0 表示不限）', at('budget'))
-			}
-			row.budget = budget
+		if (raw.billing !== undefined) {
+			const parsedBilling = parseBillingRow(raw.billing, atSource('billing'))
+			if (parsedBilling.error !== undefined) return failure('INVALID_BILLING', parsedBilling.error, atSource('billing'))
+			if (parsedBilling.billing !== undefined) source.billing = parsedBilling.billing
 		}
 		if (raw.disabled !== undefined) {
-			// 手动停用（**不是删除**）：源留在文档里、不参与搜索，随时可以再启用
-			if (typeof raw.disabled !== 'boolean') return failure('INVALID_CONFIG', 'disabled 必须是布尔值', at('disabled'))
-			if (raw.disabled) row.disabled = true
+			// 手动停用（**不是删除**）：源留在文档里、它的 key 全部不参与搜索，随时可以再启用
+			if (typeof raw.disabled !== 'boolean') return failure('INVALID_CONFIG', 'disabled 必须是布尔值', atSource('disabled'))
+			if (raw.disabled) source.disabled = true
 		}
 
-		if (raw.mode === 'env') {
-			const ref = typeof raw.ref === 'string' ? raw.ref.trim() : ''
-			if (ref.length === 0) return failure('INVALID_REF', '环境变量名不能为空', at('ref'))
-			if (ref.length > MAX_REF_LENGTH || !REF_PATTERN.test(ref)) {
-				return failure('INVALID_REF', '环境变量名必须是形如 TENCENTCLOUD_SECRET_KEY 的标识符', at('ref'))
+		if (!Array.isArray(rawKeys)) return failure('INVALID_CONFIG', 'keys 必须是数组', atSource('keys'))
+		if (rawKeys.length === 0) return failure('INVALID_CONFIG', '每个源至少要有一个 key', atSource('keys'))
+		if (rawKeys.length > MAX_KEYS) return failure('TOO_MANY_KEYS', `每个源最多 ${MAX_KEYS} 个 key`, atSource('keys'))
+
+		for (const [keyIndex, rawKey] of rawKeys.entries()) {
+			const atKey = (name) => `sources[${sourceIndex}].keys[${keyIndex}].${name}`
+			if (!isPlainObject(rawKey)) return failure('INVALID_CONFIG', `keys[${keyIndex}] 必须是对象`, `sources[${sourceIndex}].keys[${keyIndex}]`)
+			if (rawKey.mode !== 'env' && rawKey.mode !== 'literal') {
+				return failure('INVALID_CONFIG', '模式必须是 "env" 或 "literal"', atKey('mode'))
 			}
-			if (usedRefs.has(ref)) return failure('DUPLICATE_REF', `凭据引用 ${JSON.stringify(ref)} 重复`, at('ref'))
+			let keyId = rawKey.id
+			if (keyId !== undefined) {
+				if (typeof keyId !== 'string' || !ID_PATTERN.test(keyId)) return failure('INVALID_CONFIG', 'key id 非法', atKey('id'))
+				if (usedKeyIds.has(keyId)) return failure('DUPLICATE_ID', `key id ${JSON.stringify(keyId)} 重复`, atKey('id'))
+			} else {
+				keyId = nextKeyIdIn(usedKeyIds)
+			}
+			usedKeyIds.add(keyId)
+
+			const key = { id: keyId, mode: rawKey.mode }
+			if (raw.kind === 'yuanbao') {
+				const secretId = typeof rawKey.secretId === 'string' ? rawKey.secretId.trim() : ''
+				if (!SECRET_ID_PATTERN.test(secretId)) {
+					return failure('INVALID_SECRET_ID', 'SecretId 必填，形如 AKID… 的腾讯云 API 密钥', atKey('secretId'))
+				}
+				key.secretId = secretId
+			}
+			if (rawKey.budget !== undefined) {
+				const budget = normalizeBudget(rawKey.budget)
+				if (budget === undefined) {
+					return failure('INVALID_BUDGET', '额度必须是 {monthly, reserve} 非负整数（reserve ≤ monthly；monthly=0 表示不限）', atKey('budget'))
+				}
+				key.budget = budget
+			}
+			if (rawKey.disabled !== undefined) {
+				if (typeof rawKey.disabled !== 'boolean') return failure('INVALID_CONFIG', 'disabled 必须是布尔值', atKey('disabled'))
+				if (rawKey.disabled) key.disabled = true
+			}
+
+			if (rawKey.mode === 'env') {
+				const ref = typeof rawKey.ref === 'string' ? rawKey.ref.trim() : ''
+				if (ref.length === 0) return failure('INVALID_REF', '环境变量名不能为空', atKey('ref'))
+				if (ref.length > MAX_REF_LENGTH || !REF_PATTERN.test(ref)) {
+					return failure('INVALID_REF', '环境变量名必须是形如 TENCENTCLOUD_SECRET_KEY 的标识符', atKey('ref'))
+				}
+				if (usedRefs.has(ref)) return failure('DUPLICATE_REF', `凭据引用 ${JSON.stringify(ref)} 重复`, atKey('ref'))
+				usedRefs.add(ref)
+				source.keys.push({ ...key, ref })
+				continue
+			}
+
+			const prior = previousKeysById.get(key.id)
+			const ref = prior !== undefined && prior.mode === 'literal' ? prior.ref : nextRefIn(usedRefs)
+			if (usedRefs.has(ref)) return failure('DUPLICATE_REF', `凭据引用 ${JSON.stringify(ref)} 重复`, atKey('ref'))
 			usedRefs.add(ref)
-			sources.push({ ...row, mode: 'env', ref })
-			continue
-		}
-
-		const prior = previousById.get(id)
-		const ref = prior !== undefined && prior.mode === 'literal' ? prior.ref : nextRefIn(usedRefs)
-		if (usedRefs.has(ref)) return failure('DUPLICATE_REF', `凭据引用 ${JSON.stringify(ref)} 重复`, at('ref'))
-		usedRefs.add(ref)
-		if (raw.secret !== undefined) {
-			if (typeof raw.secret !== 'string' || raw.secret.length === 0) {
-				return failure('INVALID_CONFIG', '明文密钥必须是非空字符串（留空表示保持原值）', at('secret'))
+			if (rawKey.secret !== undefined) {
+				if (typeof rawKey.secret !== 'string' || rawKey.secret.length === 0) {
+					return failure('INVALID_CONFIG', '明文密钥必须是非空字符串（留空表示保持原值）', atKey('secret'))
+				}
+				if (rawKey.secret.length > MAX_SECRET_LENGTH) {
+					return failure('INVALID_CONFIG', `明文密钥超过 ${MAX_SECRET_LENGTH} 个字符`, atKey('secret'))
+				}
+				secrets.push({ id: key.id, ref, secret: rawKey.secret })
 			}
-			if (raw.secret.length > MAX_SECRET_LENGTH) {
-				return failure('INVALID_CONFIG', `明文密钥超过 ${MAX_SECRET_LENGTH} 个字符`, at('secret'))
-			}
-			secrets.push({ id, ref, secret: raw.secret })
+			source.keys.push({ ...key, ref })
 		}
-		sources.push({ ...row, mode: 'literal', ref })
+		sources.push(source)
 	}
 
 	return { ok: true, sources, secrets }
 }
 
 /**
- * 搜索腿的固定顺序：文档里的源按序，最后接官方兜底（若那条行已挂载）。
+ * 搜索腿的固定顺序：**源按文档顺序，源内 key 按顺序**，最后接官方兜底（若那条行已挂载）。
  *
- * 腿只带「定位」信息（kind/id/ref）；额度、secretId 这些从文档按 id 查，
- * 这样腿序这个概念不必知道源的全部字段（也少一处要同步的形状）。
- * @param sources - 文档里的源（有序）。
+ * 腿只带「定位」信息（kind / sourceId / keyId / ref）；额度、secretId 这些从文档按 keyId 查，
+ * 这样腿序这个概念不必知道 key 的全部字段（也少一处要同步的形状）。
+ *
+ * 这里只过滤**手动停用**（源或 key 上的 `disabled`）与**自动停用**（运行时状态）；
+ * 额度是否用完要读账本，留给宿主在搜索时判断（`quota-exhausted`）。
+ *
+ * @param sources - 文档里的源（有序，每个带 `keys`）。
+ * @param runtime - 运行时状态（按 key id 记失败/自动停用）。
+ * @param fallback - 兜底源行的注册表条目；`undefined` = 未挂载。
+ */
+export function orderedKeyLegs(sources, runtime, fallback) {
+	const legs = []
+	for (const source of sources) {
+		if (source.disabled === true) continue
+		for (const key of source.keys ?? []) {
+			if (key.disabled === true) continue
+			if (autoDisabledOf(runtime, key.id) !== undefined) continue
+			legs.push({ kind: source.kind, sourceId: source.id, keyId: key.id, ref: key.ref })
+		}
+	}
+	if (fallback !== undefined) legs.push({ kind: 'deepseek', sourceId: 'deepseek-official', keyId: fallback.slot, ref: fallback.keyRef })
+	return legs
+}
+
+/**
+ * **v2 形状的便利函数**：按文档顺序给出「源级路径」（每条源一条腿，ref 取它的第一把 key）。
+ * 三级模型下真正的腿序是 `orderedKeyLegs(sources, runtime, fallback)`（一个源可能有多把 key）。
+ * @param sources - 文档里的源（v2 或 v3 形状都行）。
  * @param fallback - 兜底源行的注册表条目；`undefined` = 未挂载。
  */
 export function orderedLegs(sources, fallback) {
-	const legs = sources.map((source) => ({ kind: source.kind, id: source.id, ref: source.ref }))
+	const legs = (sources ?? []).map((source) => ({
+		kind: source.kind,
+		id: source.id,
+		ref: source.ref ?? source.keys?.[0]?.ref,
+	}))
 	if (fallback !== undefined) legs.push({ kind: 'deepseek', id: fallback.slot, ref: fallback.keyRef })
 	return legs
+}
+/** 一个源里**还有可用 key**（手动未停用、也未自动停用）——注意这里不看额度。 */
+export function sourceHasUsableKey(source, runtime) {
+	// 兼容 v2 形状（没有 keys）：源本身就是唯一那把 key
+	if (!Array.isArray(source.keys)) return autoDisabledOf(runtime, source.id) === undefined
+	return source.keys.some((key) => key.disabled !== true && autoDisabledOf(runtime, key.id) === undefined)
+}
+
+/**
+ * 参与搜索的源：**手动停用的源**与**所有 key 都不可用的源**都不算。
+ * 顺序保持文档顺序 —— 停用只是"跳过"，不是删除，重新启用后回到原位。
+ */
+export function selectableSources(sources, runtime) {
+	return sources.filter((source) => sourceHasUsableKey(source, runtime))
 }
 
 //#region 运行时状态：失败计数与「自动停用」（**不是删除**）
@@ -627,16 +859,6 @@ export function autoDisabledOf(state, id) {
 }
 
 /**
- * 参与搜索的源：**手动停用**（文档里的 `disabled`）与**自动停用**（运行时状态）都不参与。
- * 顺序保持文档顺序 —— 停用只是"跳过"，不是删除，重新启用后回到原位。
- * @param sources - 文档里的源（有序）。
- * @param runtime - 运行时状态（可缺省 = 没有自动停用）。
- */
-export function selectableSources(sources, runtime) {
-	return sources.filter((source) => source.disabled !== true && autoDisabledOf(runtime, source.id) === undefined)
-}
-
-/**
  * 记一次失败：连续 `AUTO_DISABLE_THRESHOLD` 次「确定性失败」⇒ 打上 `autoDisabledAt`。
  *
  * 只给**确定性失败**（鉴权失败、套餐超限、404 之类）调用：超时/429/5xx 属于暂时性，
@@ -692,13 +914,18 @@ export function clearAutoDisable(state, id) {
  * @param nextSources - 校验通过后的新源列表。
  */
 export function unusedRefs(previousDoc, nextSources) {
-	const live = new Set(nextSources.map((source) => source.ref))
+	// key 级（v3）+ 源级（v2 兼容：源本身就是一把 key）两种形状都收
+	const keyRefsOf = (source) => (Array.isArray(source.keys) ? source.keys.map((key) => key.ref) : [source.ref])
+	const live = new Set()
+	for (const source of nextSources) for (const ref of keyRefsOf(source)) live.add(ref)
 	const removed = []
 	for (const source of previousDoc.sources) {
-		if (!source.ref.startsWith(LITERAL_REF_PREFIX)) continue
-		if (live.has(source.ref)) continue
-		if (removed.includes(source.ref)) continue
-		removed.push(source.ref)
+		for (const ref of keyRefsOf(source)) {
+			if (typeof ref !== 'string' || !ref.startsWith(LITERAL_REF_PREFIX)) continue
+			if (live.has(ref)) continue
+			if (removed.includes(ref)) continue
+			removed.push(ref)
+		}
 	}
 	return removed
 }

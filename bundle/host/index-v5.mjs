@@ -23,7 +23,9 @@
 import { appendFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
+	DEFAULT_UNIT_BY_KIND,
 	ID_PATTERN,
+	MAX_KEYS,
 	MAX_MONTHLY_BUDGET,
 	MAX_SOURCES,
 	REF_PATTERN,
@@ -35,11 +37,13 @@ import {
 	defaultBudgetFor,
 	defaultDocument,
 	describeAttempts,
-	effectiveBudget,
-	orderedLegs,
+	keyBudget,
+	orderedKeyLegs,
 	recordFailure,
 	recordSuccess,
 	selectableSources,
+	sourceHasUsableKey,
+	sourceUnit,
 	unusedRefs,
 	usageCount,
 	usageCredits,
@@ -707,15 +711,41 @@ export class ChainSearchProvider {
 		}
 	}
 
-	/** 按固定腿序跑一次搜索。 */
+	/**
+	 * 按固定腿序跑一次搜索：**源按文档顺序，源内 key 按顺序**，最后接官方兜底（若已挂载）。
+	 *
+	 * 三级模型的语义（2026-10-23）：
+	 * 1. 手动停用（源或 key 上的 `disabled`）与自动停用（运行时状态，按 **key** 记）都不进腿序；
+	 * 2. **额度按 key 单独算**：某个 key 用完 ⇒ 换同源的下一个 key；整个源的 key 都用完/停用 ⇒ 换下一个源；
+	 * 3. 计费单位跟着源走（元宝/DS=按次，Tavily=按 credit），所以闸门读账本时用源的 `unit`。
+	 */
 	async search(request, signal) {
 		const config = this.getConfig()
 		const { doc } = this.readDocument()
 		const runtime = this.readRuntime().state
-		// 手动停用（doc.disabled）与自动停用（runtime）都不进腿序；停用只是跳过，不是删除
-		const legs = orderedLegs(selectableSources(doc.sources, runtime), [...enabledFallback.values()][0])
-		const attempts = []
 		const month = beijingMonthKey(this.now())
+		// 源级预判：把「整个源的 key 都耗尽」这种情形单独记一行审计，免得事后翻一堆 per-key 行
+		for (const source of selectableSources(doc.sources, runtime)) {
+			const unit = sourceUnit(source)
+			const keys = (source.keys ?? []).filter((key) => key.disabled !== true && autoDisabledOf(runtime, key.id) === undefined)
+			const exhausted = keys.filter((key) => {
+				const used = unit === 'credits' ? this.creditsThisMonth(key.id, month) : this.usedThisMonth(key.id, month)
+				return budgetStatus(keyBudget(source, key), used, this.now()).exhausted
+			})
+			if (keys.length > 0 && exhausted.length === keys.length) {
+				this.record(config, {
+					outcome: 'source-exhausted',
+					target: source.kind,
+					source: source.id,
+					query: request.query,
+					unit,
+					keys: keys.map((key) => key.id),
+				})
+			}
+		}
+		// 手动停用与自动停用都不进腿序；停用只是跳过，不是删除
+		const legs = orderedKeyLegs(doc.sources, runtime, [...enabledFallback.values()][0])
+		const attempts = []
 
 		for (const leg of legs) {
 			throwIfAborted(signal)
@@ -723,7 +753,7 @@ export class ChainSearchProvider {
 				this.record(config, {
 					outcome: 'delegating',
 					target: 'deepseek-official',
-					slot: leg.id,
+					slot: leg.keyId,
 					ref: leg.ref,
 					query: request.query,
 					priorAttempts: attempts,
@@ -733,112 +763,92 @@ export class ChainSearchProvider {
 				return provider.search(request, signal)
 			}
 
-			// 腿只带定位信息，额度/SecretId 这些从文档按 id 取（见 core.orderedLegs 的注释）
-			const source = doc.sources.find((candidate) => candidate.id === leg.id) ?? { id: leg.id, kind: leg.kind, ref: leg.ref }
-			const apiKey = await this.resolveCredential(leg.ref)
+			// 腿只带定位信息，额度/SecretId/计费单位这些从文档按 sourceId + keyId 取
+			const source = doc.sources.find((candidate) => candidate.id === leg.sourceId)
+			const key = source?.keys?.find((candidate) => candidate.id === leg.keyId)
+			if (source === undefined || key === undefined) {
+				attempts.push({ id: leg.keyId, ref: leg.ref, outcome: 'stale-leg' })
+				continue
+			}
+			const unit = sourceUnit(source)
+			const apiKey = await this.resolveCredential(key.ref)
 			if (apiKey === undefined) {
-				attempts.push({ id: leg.id, ref: leg.ref, outcome: 'credential-missing' })
+				attempts.push({ id: key.id, ref: key.ref, outcome: 'credential-missing' })
 				continue
 			}
 
-			if (leg.kind === 'yuanbao') {
-				const secretId = optionalString(source.secretId)
-				if (secretId === undefined) {
-					attempts.push({ id: leg.id, ref: leg.ref, outcome: 'credential-missing', message: 'SecretId is missing' })
-					continue
-				}
-				const status = budgetStatus(source, this.usedThisMonth(leg.id, month), this.now())
-				if (status.exhausted) {
-					// 到点即停：不花那 4 倍的钱，把机会交给后面的腿（官方兜底那条行才是花钱总开关）
-					this.record(config, {
-						outcome: 'quota-exhausted',
-						target: 'yuanbao',
-						slot: leg.id,
-						ref: leg.ref,
-						query: request.query,
-						budget: status,
-						unit: 'calls',
-						priorAttempts: attempts,
-					})
-					attempts.push({
-						id: leg.id,
-						ref: leg.ref,
-						outcome: 'quota-exhausted',
-						message: `${status.used}/${status.monthly} calls used this month (reserve ${status.reserve})`,
-					})
-					continue
-				}
-				const used = this.bumpUsage(leg.id, month)
-				try {
-					const result = await this.searchYuanbao(config, { secretId, secretKey: apiKey }, request, signal)
-					this.noteSuccess(leg.id)
-					this.record(config, {
-						outcome: 'served',
-						target: 'yuanbao',
-						slot: leg.id,
-						ref: leg.ref,
-						query: request.query,
-						sources: result.sources.length,
-						apiVersion: result.version,
-						requestId: result.requestId,
-						used,
-						...(result.freshness === undefined ? {} : { freshness: result.freshness }),
-						...(result.site === undefined ? {} : { site: result.site }),
-						budget: { monthly: status.monthly, reserve: status.reserve },
-						priorAttempts: attempts,
-					})
-					return { sources: result.sources, truncated: false }
-				} catch (error) {
-					if (signal?.aborted === true) throw error
-					const message = error instanceof Error ? error.message : String(error)
-					if (error?.permanent === true) this.noteFailure(config, leg.id, 'yuanbao', message)
-					attempts.push({ id: leg.id, ref: leg.ref, outcome: 'failed', message })
-					continue
-				}
-			}
-
-			// deepseek-api 与 tavily 都是「一把 key + 一个 REST 端点」，共用同一个失败推进形状
-			const target = leg.kind === 'deepseek-api' ? 'deepseek-api' : 'tavily'
-			// Tavily 按 **credit** 计量（basic 1 / advanced 2），其余按**调用次数**
-			const unit = target === 'tavily' ? 'credits' : 'calls'
-			const usedInUnit = unit === 'credits' ? this.creditsThisMonth(leg.id, month) : this.usedThisMonth(leg.id, month)
-			const status = budgetStatus(source, usedInUnit, this.now())
+			const usedInUnit = unit === 'credits' ? this.creditsThisMonth(key.id, month) : this.usedThisMonth(key.id, month)
+			const status = budgetStatus(keyBudget(source, key), usedInUnit, this.now())
 			if (status.exhausted) {
+				// 到点即停：不花那 4 倍的钱，把机会交给同源的下一个 key / 后面的源
 				this.record(config, {
 					outcome: 'quota-exhausted',
-					target,
-					slot: leg.id,
-					ref: leg.ref,
+					target: leg.kind,
+					source: source.id,
+					slot: key.id,
+					ref: key.ref,
 					query: request.query,
 					budget: status,
 					unit,
 					priorAttempts: attempts,
 				})
 				attempts.push({
-					id: leg.id,
-					ref: leg.ref,
+					id: key.id,
+					ref: key.ref,
 					outcome: 'quota-exhausted',
 					message: `${status.used}/${status.monthly} ${unit} used this month (reserve ${status.reserve})`,
 				})
 				continue
 			}
-			const calls = this.bumpUsage(leg.id, month)
+
+			const calls = this.bumpUsage(key.id, month)
 			try {
+				if (leg.kind === 'yuanbao') {
+					const secretId = optionalString(key.secretId)
+					if (secretId === undefined) {
+						attempts.push({ id: key.id, ref: key.ref, outcome: 'credential-missing', message: 'SecretId is missing' })
+						continue
+					}
+					const result = await this.searchYuanbao(config, { secretId, secretKey: apiKey }, request, signal)
+					this.noteSuccess(key.id)
+					this.record(config, {
+						outcome: 'served',
+						target: 'yuanbao',
+						source: source.id,
+						slot: key.id,
+						ref: key.ref,
+						query: request.query,
+						sources: result.sources.length,
+						apiVersion: result.version,
+						requestId: result.requestId,
+						used: calls,
+						unit,
+						...(result.freshness === undefined ? {} : { freshness: result.freshness }),
+						...(result.site === undefined ? {} : { site: result.site }),
+						budget: { monthly: status.monthly, reserve: status.reserve },
+						priorAttempts: attempts,
+					})
+					return { sources: result.sources, truncated: false }
+				}
+
+				const target = leg.kind === 'deepseek-api' ? 'deepseek-api' : 'tavily'
 				const result =
 					leg.kind === 'deepseek-api'
 						? await this.searchDeepseekApi(config, apiKey, request, signal)
 						: await this.searchTavily(config, apiKey, request, signal)
-				this.noteSuccess(leg.id)
-				const credits = result.credits === undefined ? undefined : this.addCredits(leg.id, month, result.credits)
+				this.noteSuccess(key.id)
+				const credits = result.credits === undefined ? undefined : this.addCredits(key.id, month, result.credits)
 				this.record(config, {
 					outcome: 'served',
 					target,
-					slot: leg.id,
-					ref: leg.ref,
+					source: source.id,
+					slot: key.id,
+					ref: key.ref,
 					query: request.query,
 					sources: result.sources.length,
 					calls,
 					...(credits === undefined ? {} : { credits }),
+					unit,
 					...(status.monthly === null ? {} : { budget: { monthly: status.monthly, reserve: status.reserve, unit } }),
 					priorAttempts: attempts,
 				})
@@ -846,8 +856,9 @@ export class ChainSearchProvider {
 			} catch (error) {
 				if (signal?.aborted === true) throw error
 				const message = error instanceof Error ? error.message : String(error)
-				if (error?.permanent === true) this.noteFailure(config, leg.id, target, message)
-				attempts.push({ id: leg.id, ref: leg.ref, outcome: 'failed', message })
+				const target = leg.kind === 'deepseek-api' ? 'deepseek-api' : leg.kind
+				if (error?.permanent === true) this.noteFailure(config, key.id, target, message)
+				attempts.push({ id: key.id, ref: key.ref, outcome: 'failed', message })
 			}
 		}
 
@@ -1258,26 +1269,61 @@ export async function readState(ctx) {
 	const month = beijingMonthKey(Date.now())
 	const sources = []
 	for (const source of doc.sources) {
-		const budget = effectiveBudget(source) ?? null
-		// Tavily 按 credit 计量；其余按调用次数（与闸门同口径）
-		const unit = source.kind === 'tavily' ? 'credits' : 'calls'
-		const calls = Math.max(usageCount(usage.doc, month, source.id), usageCache.get(`${month}:${source.id}`) ?? 0)
-		const credits = Math.max(usageCredits(usage.doc, month, source.id), creditCache.get(`${month}:${source.id}`) ?? 0)
-		const used = unit === 'credits' ? credits : calls
+		const unit = sourceUnit(source)
+		const pricePer1000 = typeof source.billing?.pricePer1000 === 'number' ? source.billing.pricePer1000 : null
+		let callsTotal = 0
+		let creditsTotal = 0
+		const keys = []
+		for (const key of source.keys ?? []) {
+			const calls = Math.max(usageCount(usage.doc, month, key.id), usageCache.get(`${month}:${key.id}`) ?? 0)
+			const credits = Math.max(usageCredits(usage.doc, month, key.id), creditCache.get(`${month}:${key.id}`) ?? 0)
+			callsTotal += calls
+			creditsTotal += credits
+			const used = unit === 'credits' ? credits : calls
+			const budget = keyBudget(source, key) ?? null
+			keys.push({
+				id: key.id,
+				mode: key.mode,
+				ref: key.ref,
+				...(key.secretId === undefined ? {} : { secretId: key.secretId }),
+				budget,
+				credential: await describeCredential(ctx, key.ref),
+				usage: { month, unit, calls, credits, ...budgetStatus(keyBudget(source, key), used, Date.now()) },
+				disabled: key.disabled === true,
+				autoDisabled: autoDisabledOf(runtime.state, key.id) ?? null,
+			})
+		}
+		const usedTotal = unit === 'credits' ? creditsTotal : callsTotal
+		const usableKeys = keys.filter((key) => key.disabled !== true && key.autoDisabled === null)
+		const exhaustedKeys = usableKeys.filter((key) => key.usage.exhausted).length
 		sources.push({
-			...source,
-			budget,
-			credential: await describeCredential(ctx, source.ref),
-			usage: { month, unit, calls, credits, ...budgetStatus(source, used, Date.now()) },
+			id: source.id,
+			kind: source.kind,
+			...(source.label === undefined ? {} : { label: source.label }),
+			billing: { unit, pricePer1000 },
 			disabled: source.disabled === true,
-			autoDisabled: autoDisabledOf(runtime.state, source.id) ?? null,
+			keys,
+			usage: {
+				month,
+				unit,
+				calls: callsTotal,
+				credits: creditsTotal,
+				used: usedTotal,
+				// 钱的估算只给"有单价"的源；单位是"元/千单位"
+				spend: pricePer1000 === null ? null : Math.round((usedTotal / 1000) * pricePer1000 * 10000) / 10000,
+			},
+			// 源级状态给界面用：ok / exhausted（所有可用 key 都到额度）/ unavailable（没有可用 key）
+			available: sourceHasUsableKey(source, runtime.state),
+			exhausted: usableKeys.length > 0 && exhaustedKeys === usableKeys.length,
+			usableKeys: usableKeys.length,
 		})
 	}
 	return {
 		ok: true,
 		version: doc.version,
 		maxSources: MAX_SOURCES,
-		templates: TEMPLATES.map((template) => ({ ...template })),
+		maxKeys: MAX_KEYS,
+		templates: TEMPLATES.map((template) => ({ ...template, unit: DEFAULT_UNIT_BY_KIND[template.kind] ?? 'calls' })),
 		// 模板默认预算：界面「添加」时预填，保证新源与"不填 budget"的语义一致（含活动额度）。
 		defaults: { budgets: Object.fromEntries(TEMPLATES.map((template) => [template.kind, defaultBudgetFor(template.kind) ?? null])) },
 		sources,
@@ -1311,31 +1357,39 @@ export async function resolveCredentialValue(ctx, reference) {
 /**
  * 查**上游**额度（目前只有 Tavily 提供 `GET /usage`；腾讯云没有对应接口，元宝只能靠本地账本）。
  *
+ * **按 key 查**（2026-10-23）：每个 key 是独立账号/独立套餐，所以入参是 key id。
  * 返回每个 id 一条：
- * - `{ok:true, plan, planUsage, planLimit, keyUsage, keyLimit, searchUsage}`（Tavily 的字段名照抄官方）
- * - `{ok:false, error}`：`unknown-source` / `unsupported-kind` / `credential-missing` / `HTTP 4xx` / `timeout` …
+ * - `{ok:true, source, plan, planUsage, planLimit, keyUsage, keyLimit, searchUsage}`（Tavily 的字段名照抄官方）
+ * - `{ok:false, error}`：`unknown-key` / `unsupported-kind` / `credential-missing` / `HTTP 4xx` / `timeout` …
  *
  * @param ctx - 插件上下文（用于凭据域）。
- * @param ids - 要查的源 id 列表。
+ * @param ids - 要查的 **key id** 列表。
  * @param options - `{baseURL, timeoutMs}`（测试注入用）。
  */
 export async function queryUsage(ctx, ids, options = {}) {
 	const { doc } = readConfigDocument(configPath())
 	const baseURL = (optionalString(options.baseURL) ?? TAVILY_DEFAULT_BASE_URL).replace(/\/+$/u, '')
 	const timeoutMs = Number.isInteger(options.timeoutMs) ? options.timeoutMs : 10000
-	const wanted = Array.isArray(ids) ? ids.filter((id) => typeof id === 'string').slice(0, MAX_SOURCES) : []
+	const wanted = Array.isArray(ids) ? ids.filter((id) => typeof id === 'string').slice(0, MAX_SOURCES * MAX_KEYS) : []
 	const results = {}
 	for (const id of wanted) {
-		const source = doc.sources.find((candidate) => candidate.id === id)
-		if (source === undefined) {
-			results[id] = { ok: false, error: 'unknown-source' }
+		let found
+		for (const source of doc.sources) {
+			const key = (source.keys ?? []).find((candidate) => candidate.id === id)
+			if (key !== undefined) {
+				found = { source, key }
+				break
+			}
+		}
+		if (found === undefined) {
+			results[id] = { ok: false, error: 'unknown-key' }
 			continue
 		}
-		if (source.kind !== 'tavily') {
+		if (found.source.kind !== 'tavily') {
 			results[id] = { ok: false, error: 'unsupported-kind' }
 			continue
 		}
-		const key = await resolveCredentialValue(ctx, source.ref)
+		const key = await resolveCredentialValue(ctx, found.key.ref)
 		if (key === undefined) {
 			results[id] = { ok: false, error: 'credential-missing' }
 			continue
@@ -1364,6 +1418,7 @@ export async function queryUsage(ctx, ids, options = {}) {
 			const keyInfo = payload?.key ?? {}
 			results[id] = {
 				ok: true,
+				source: found.source.id,
 				plan: optionalString(account.current_plan),
 				planUsage: Number.isInteger(account.plan_usage) ? account.plan_usage : null,
 				planLimit: Number.isInteger(account.plan_limit) ? account.plan_limit : null,
@@ -1389,12 +1444,14 @@ function respond(status, payload) {
  */
 function parseUsagePatch(raw, sources) {
 	if (raw === undefined) return { ok: true, values: {} }
-	if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, message: 'usage 必须是 {源id: 次数} 的对象' }
-	const live = new Set(sources.map((source) => source.id))
+	if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, message: 'usage 必须是 {key id: 次数} 的对象' }
+	// 额度按 key 记账（2026-10-23），所以校准的键是 key id
+	const live = new Set()
+	for (const source of sources) for (const key of source.keys ?? []) live.add(key.id)
 	const values = {}
 	for (const [id, value] of Object.entries(raw)) {
-		if (!ID_PATTERN.test(id)) return { ok: false, message: `usage 里的源 id ${JSON.stringify(id)} 非法` }
-		if (!live.has(id)) return { ok: false, message: `usage 里的源 ${JSON.stringify(id)} 不在这份配置里` }
+		if (!ID_PATTERN.test(id)) return { ok: false, message: `usage 里的 key id ${JSON.stringify(id)} 非法` }
+		if (!live.has(id)) return { ok: false, message: `usage 里的 key ${JSON.stringify(id)} 不在这份配置里` }
 		if (!Number.isInteger(value) || value < 0 || value > MAX_MONTHLY_BUDGET) {
 			return { ok: false, message: `usage.${id} 必须是不大于 ${MAX_MONTHLY_BUDGET} 的非负整数` }
 		}
@@ -1492,7 +1549,8 @@ export async function applyConfig(ctx, body) {
 	const restoredAuto = {}
 	if (Array.isArray(body?.resetAutoDisabled) && body.resetAutoDisabled.length > 0) {
 		try {
-			const known = new Set(validation.sources.map((source) => source.id))
+			const known = new Set()
+			for (const source of validation.sources) for (const key of source.keys ?? []) known.add(key.id)
 			let next = readRuntimeState(runtimePath()).state
 			for (const id of body.resetAutoDisabled) {
 				if (typeof id !== 'string' || !known.has(id)) continue

@@ -8,7 +8,7 @@ const dir = tempDir('chain-provider')
 process.env.DSH_HOME = dir
 
 const { apply, ChainSearchProvider, normalizeChain, configPath, __resetFallbackRegistryForTests } = await import('../bundle/host/index-v5.mjs')
-const { emptyDocument, orderedLegs } = await import('../bundle/host/core.mjs')
+	const { emptyDocument, orderedKeyLegs } = await import('../bundle/host/core.mjs')
 
 // 模块级兜底注册表在同一进程里被别的测试文件挂过 ⇒ 先清空，保证本文件的断言与顺序无关
 // （本文件跑在 run-all 的最前面，但别把"字母序"当成隔离手段）。
@@ -193,8 +193,9 @@ await test('兜底行的注册表条目由源行发布：apply({role:"source"}) 
 	apply(ctx2, { role: 'source', slot: 'deepseek', kind: 'deepseek', keyRef: 'DEEPSEEK_API_KEY' })
 	setDoc([{ id: 's1', kind: 'tavily', mode: 'env', ref: 'K1' }])
 	// 只断言「腿序里有 deepseek」：真跑会去 import 官方 provider 包，离线环境拿不到。
-	const legs = orderedLegs(
-		[{ id: 's1', kind: 'tavily', mode: 'env', ref: 'K1' }],
+	const legs = orderedKeyLegs(
+		[{ id: 's1', kind: 'tavily', keys: [{ id: 'k1', mode: 'env', ref: 'K1' }] }],
+		undefined,
 		{ slot: 'deepseek', keyRef: 'DEEPSEEK_API_KEY' },
 	)
 	assert.deepEqual(legs.map((leg) => leg.kind), ['tavily', 'deepseek'])
@@ -212,7 +213,7 @@ await test('未知 role ⇒ 抛错（配置写错时立刻可见）', () => {
 })
 
 await test('emptyDocument 仍是空文档（回归守卫）', () => {
-	assert.deepEqual(emptyDocument(), { version: 2, sources: [] })
+	assert.deepEqual(emptyDocument(), { version: 3, sources: [] })
 })
 
 //#region 元宝搜索腿（2026-10-22）

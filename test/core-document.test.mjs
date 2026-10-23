@@ -12,12 +12,18 @@ const YUANBAO = {
 	budget: { monthly: 2000, reserve: 100, promo: { monthly: 6000, until: '2026-11-30' } },
 }
 
-await test('默认文档播种两条 Tavily：TAVILY_API_KEY1 → TAVILY_API_KEY2（2026-09-29 用户选定）', () => {
+await test('默认文档播种一个 Tavily 源 + 两把 key（2026-10-23 三级模型）', () => {
 	const doc = defaultDocument()
 	assert.equal(doc.version, DOCUMENT_VERSION)
 	assert.deepEqual(doc.sources, [
-		{ id: 's1', kind: 'tavily', mode: 'env', ref: 'TAVILY_API_KEY1' },
-		{ id: 's2', kind: 'tavily', mode: 'env', ref: 'TAVILY_API_KEY2' },
+		{
+			id: 's1',
+			kind: 'tavily',
+			keys: [
+				{ id: 'k1', mode: 'env', ref: 'TAVILY_API_KEY1' },
+				{ id: 'k2', mode: 'env', ref: 'TAVILY_API_KEY2' },
+			],
+		},
 	])
 })
 
