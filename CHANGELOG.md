@@ -1,5 +1,29 @@
 # 变更记录
 
+## 3.1.0（2026-11-14）
+
+**一个安装入口同时接管 `web_search` 与 `web_fetch`。** 原先 `web_fetch` 靠一个用绝对路径 `insert` 挂载的本地原型
+（`plugins/dsh-web-deepseek-api`）提供，换台机器就失效；本版把抓取梯队并入 bundle 宿主模块，随包发布。
+
+### 新增
+
+- 抓取梯队 `http-leg → tavily-extract → deepseek-fetch-api`：本地 HTTP（免费）→ [Tavily Extract](https://docs.tavily.com/documentation/api-reference/endpoint/extract)（basic 每 5 次成功 URL = 1 credit，失败不收费）→ DS 官方 Fetch API（0.005 元/成功次）。
+- 抓取腿与搜索腿**共享** `$DSH_HOME\web-search-chain.json` 的 Tavily 源 / key / credits，不另立账本；
+  某把 key 上游报「用满」（402/429/432 或额度文案）自动切下一把，两把都尽才落到 DS。
+- DS 兜底只由 `fetch.dsFetchFallback` 开关控制，不做月度计数；设为 `false` 即彻底不走 DS。
+- 「用满」记忆按**北京时间自然月**自动恢复（每月 1 号，东八区），不用改配置、不用重启；跨月写
+  `tavily-extract-quota-reset` 审计行。
+- 抓取审计独立写 `$DSH_HOME\web-fetch-chain.log`（与 `web-search-chain.log` 分文件）。
+- 新增 `bundle/host/fetch-chain.mjs`（零 `@deepseek-ai/*` 静态依赖）；`apply` 同时注册
+  `registerSearchProvider` 与 `registerFetchProvider(chain-fetch)`，`inject: ['web']` 与配置路由时序不变。
+
+### 兼容 / 安装
+
+- 一个命令装齐三个包：`dsh plugin --profile desktop add dsh-websearch-tavily-keys-select@3.1.0`。
+- 搜索侧腿序、配置卡片、v2→v3 文档迁移全部不变；本次只新增 `fetch` 配置段（有默认值，旧配置可直接工作）。
+- ⚠️ 启用抓取梯队还需把 profile 的 `web.fetchProvider` 指向 `chain-fetch`（本机切换是独立后续步骤，本版不改任何 profile 文件）。
+- 验证：宿主测试 **10 文件全绿**（新增 `fetch-chain.test.mjs` 15/15）、客户端验证台、变异、`npm pack --dry-run` 含 `host/fetch-chain.mjs`。
+
 ## 3.0.0（2026-10-23）
 
 **三级模型：源 → key → 额度。** 配置文档升到 `version: 3`（旧配置**自动迁移**，key id 沿用源 id）。

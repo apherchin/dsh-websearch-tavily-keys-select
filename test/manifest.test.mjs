@@ -51,6 +51,27 @@ await test('链路行仍声明 tavily 传输设置（整体替换语义，别丢
 	}
 })
 
+await test('3.1.0：链路行声明 fetch 抓取梯队全部字段', () => {
+	const yml = read('bundle/cordis.patch.yml')
+	for (const needle of ['fetch:', 'dsFetchFallback: true', 'extractDepth: basic', 'format: markdown',
+		'maxChars: 100000', 'deepseekBaseURL: https://api.deepseek.com/v1/tools', 'apiKeyEnv: DEEPSEEK_API_KEY']) {
+		assert.ok(yml.includes(needle), needle)
+	}
+})
+
+await test('3.1.0：bundle files 覆盖 host/fetch-chain.mjs（npm 通配语义）', () => {
+	const pkg = readJson('bundle/package.json')
+	const patterns = pkg.files.filter((f) => f.startsWith('host/') && f.endsWith('.mjs'))
+	// `host/*.mjs` 是 npm 的通配（pack 时会把该目录所有 .mjs 打进去），不是字面文件名。
+	assert.ok(patterns.some((p) => p.includes('*') || p.includes('fetch-chain.mjs')), JSON.stringify(pkg.files))
+})
+
+await test('3.1.0：host 半边静态 import fetch-chain.mjs（同一包内相对路径）', () => {
+	const code = read('bundle/host/index-v5.mjs')
+	assert.ok(code.includes("from './fetch-chain.mjs'"))
+	assert.ok(code.includes('registerFetchProvider'))
+})
+
 await test('行包 dsh-search-chain：main + exports["./client"] + dsh.client.platform=web', () => {
 	const pkg = readJson('row-chain/package.json')
 	assert.equal(pkg.name, 'dsh-search-chain')

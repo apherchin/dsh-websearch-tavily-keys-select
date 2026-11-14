@@ -113,7 +113,12 @@ export function makeFakeCtx(options = {}) {
 		effect: (callback, label) => {
 			effects.push({ label, dispose: callback() })
 		},
-		web: { registerSearchProvider: (provider) => { ctx.__provider = provider } },
+		web: {
+			registerSearchProvider: (provider) => { ctx.__provider = provider },
+			// 3.1.0：抓取梯队并入后 apply 也会注册 fetch provider；用数组捕获，
+			// 保持旧的 __provider（搜索）语义不变，避免 31 条 chain-provider 断言受影响。
+			registerFetchProvider: (provider) => { (ctx.__fetchProviders ??= []).push(provider) },
+		},
 		__effects: effects,
 		/** 模拟「`name` 服务稍后就绪」：投递所有已满足的等待者。 */
 		__deliver(name) {

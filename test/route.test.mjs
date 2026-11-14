@@ -6,7 +6,7 @@ import { test, summary, assert, tempDir, cleanup, makeFakeCtx, makeFakeCredentia
 const dir = tempDir('route')
 process.env.DSH_HOME = dir
 
-const { CONFIG_PATH, apply, routeFetch, readState, configPath, usagePath, __resetFallbackRegistryForTests } = await import('../bundle/host/index-v5.mjs')
+const { CONFIG_PATH, apply, routeFetch, readState, queryUsage, configPath, usagePath, __resetFallbackRegistryForTests } = await import('../bundle/host/index-v5.mjs')
 const { readConfigDocument, readUsageDocument, writeConfigDocument, writeUsageDocument } = await import('../bundle/host/config-store.mjs')
 const { MAX_SOURCES, beijingMonthKey } = await import('../bundle/host/core.mjs')
 
@@ -447,6 +447,95 @@ await test('POST queryUsage：查上游 Tavily /usage（GET + Bearer），非 Ta
 		assert.deepEqual(body.results.nope, { ok: false, error: 'unknown-key' })
 	} finally {
 		globalThis.fetch = realFetch
+	}
+})
+
+// ★回归（2026-11-10 真机）：Tavily 的 429 带 `Retry-After: 60`（秒）。
+// 1.2s 后重试必然还是 429；必须按响应头给的冷却时间等，且要有上限，不能让卡片挂 60s+。
+await test('queryUsage：429 的 Retry-After 决定重试等待（有上限，且可注入）', async () => {
+	const ctx = makeFakeCtx({ credentials: makeFakeCredentials({ values: { TAVILY_API_KEY1: 'tvly-1' } }) })
+	writeConfigDocument(configPath(), { sources: [{ kind: 'tavily', keys: [{ id: 'k1', mode: 'env', ref: 'TAVILY_API_KEY1' }] }] })
+	const realFetch = globalThis.fetch
+	const waits = []
+	let calls = 0
+	globalThis.fetch = async () => {
+		calls += 1
+		if (calls === 1) return new Response(JSON.stringify({ detail: { error: 'excessive requests' } }), { status: 429, headers: { 'content-type': 'application/json', 'retry-after': '60' } })
+		return new Response(JSON.stringify({ key: {}, account: { current_plan: 'Researcher', plan_usage: 0, plan_limit: 1000 } }), { status: 200, headers: { 'content-type': 'application/json' } })
+	}
+	const neverSleep = async (ms) => { waits.push(ms) }
+	try {
+		const result = await queryUsage(ctx, ['k1'], { timeoutMs: 1000, sleep: neverSleep, maxRetryDelayMs: 15000 })
+		assert.equal(calls, 2)
+		assert.deepEqual(waits, [15000], `应按 Retry-After 换算并夹到上限，实际 ${JSON.stringify(waits)}`)
+		assert.equal(result.results.k1.ok, true)
+	} finally {
+		globalThis.fetch = realFetch
+	}
+})
+
+// ★回归（2026-11-10 真机）：Tavily /usage 会对短时间内的重复请求返回 429
+// "Your request has been blocked due to excessive requests. Please reduce the rate of requests."
+// 卡片每把 key 各点一次「查额度」就会撞上。只读动作应自动重试一次瞬态失败，
+// 而不是把上游的英文 429 原文甩给用户。
+await test('queryUsage：429 瞬态失败自动重试一次后成功', async () => {
+	const ctx = makeFakeCtx({ credentials: makeFakeCredentials({ values: { TAVILY_API_KEY1: 'tvly-1' } }) })
+	writeConfigDocument(configPath(), { sources: [{ kind: 'tavily', keys: [{ id: 'k1', mode: 'env', ref: 'TAVILY_API_KEY1' }] }] })
+	const realFetch = globalThis.fetch
+	let calls = 0
+	globalThis.fetch = async () => {
+		calls += 1
+		if (calls === 1) return new Response(JSON.stringify({ detail: { error: 'excessive requests' } }), { status: 429, headers: { 'content-type': 'application/json' } })
+		return new Response(JSON.stringify({ key: { usage: 1, limit: null }, account: { current_plan: 'Researcher', plan_usage: 1, plan_limit: 1000, search_usage: 1 } }), { status: 200, headers: { 'content-type': 'application/json' } })
+	}
+	try {
+		const result = await queryUsage(ctx, ['k1'], { timeoutMs: 1000, retryDelayMs: 0 })
+		assert.equal(calls, 2, '应重试一次')
+		assert.equal(result.results.k1.ok, true, JSON.stringify(result.results.k1))
+		assert.equal(result.results.k1.planUsage, 1)
+	} finally {
+		globalThis.fetch = realFetch
+	}
+})
+
+await test('queryUsage：429 重试仍失败 ⇒ 给出限流提示，不甩英文原文', async () => {
+	const ctx = makeFakeCtx({ credentials: makeFakeCredentials({ values: { TAVILY_API_KEY1: 'tvly-1' } }) })
+	writeConfigDocument(configPath(), { sources: [{ kind: 'tavily', keys: [{ id: 'k1', mode: 'env', ref: 'TAVILY_API_KEY1' }] }] })
+	const realFetch = globalThis.fetch
+	let calls = 0
+	globalThis.fetch = async () => {
+		calls += 1
+		return new Response(JSON.stringify({ detail: { error: 'excessive requests' } }), { status: 429, headers: { 'content-type': 'application/json' } })
+	}
+	try {
+		const result = await queryUsage(ctx, ['k1'], { timeoutMs: 1000, retryDelayMs: 0 })
+		assert.equal(calls, 2, '最多重试一次，不能无限打')
+		assert.equal(result.results.k1.ok, false)
+		assert.match(result.results.k1.error, /限流|稍后/, JSON.stringify(result.results.k1))
+	} finally {
+		globalThis.fetch = realFetch
+	}
+})
+
+// ★回归（2026-11-10 真机）：Tavily /usage 在本机实测会慢到 14~25s，且突发会 429。
+// 旧默认 10s 让「查额度」几乎必然报 timeout；这里锁住默认超时不再短于 30s，
+// 并且显式传入的 timeoutMs 仍然优先（测试注入点不能被吃掉）。
+await test('queryUsage：默认超时不短于 30s，且显式 timeoutMs 仍可覆盖', async () => {
+	const ctx = makeFakeCtx({ credentials: makeFakeCredentials({ values: { TAVILY_API_KEY1: 'tvly-1' } }) })
+	writeConfigDocument(configPath(), { sources: [{ kind: 'tavily', keys: [{ id: 'k1', mode: 'env', ref: 'TAVILY_API_KEY1' }] }] })
+	const realFetch = globalThis.fetch
+	const realTimeout = AbortSignal.timeout
+	const deadlines = []
+	globalThis.fetch = async () => new Response(JSON.stringify({ key: {}, account: {} }), { status: 200, headers: { 'content-type': 'application/json' } })
+	AbortSignal.timeout = (ms) => { deadlines.push(ms); return new AbortController().signal }
+	try {
+		await queryUsage(ctx, ['k1'])
+		assert.equal(deadlines[0] >= 30000, true, `默认超时 ${deadlines[0]}ms 太短，应 ≥ 30000ms`)
+		await queryUsage(ctx, ['k1'], { timeoutMs: 1234 })
+		assert.equal(deadlines[1], 1234, '显式注入的超时必须优先')
+	} finally {
+		globalThis.fetch = realFetch
+		AbortSignal.timeout = realTimeout
 	}
 })
 

@@ -505,7 +505,12 @@ ull`（**不带这个字段** ⇒ 服务端用模板默认额度）；
 					if (!SECRET_ID_PATTERN.test(secretId)) return copy.needSecretId;
 				}
 				// 额度只在"这一行确实填了额度"时才校验（空 = 用模板默认值）
-				if (row.budgetMonthly !== undefined || row.budgetReserve !== undefined) {
+				// ⚠️ 判据必须是「内容非空」，不能是「字段存在」：draftFromState 对 budget:null 的行
+			// 也会写出两个空串字段，用 `!== undefined` 会把合法的不限额度行全判成 badBudget
+			// （2026-11-09 真机：红字指向不可编辑的隐藏行，且「保存」被禁用）。
+			const monthlyText = String(row.budgetMonthly ?? "").trim();
+			const reserveText = String(row.budgetReserve ?? "").trim();
+			if (monthlyText.length > 0 || reserveText.length > 0) {
 					const budget = budgetOf(row);
 					if (budget === null) return copy.badBudget;
 					if (budget.monthly === 0 ? budget.reserve !== 0 : budget.reserve > budget.monthly) return copy.badBudget;

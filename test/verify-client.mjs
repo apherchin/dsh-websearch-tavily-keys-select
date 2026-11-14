@@ -407,6 +407,34 @@ check('firstProblem：同一个源的 key 超过 4 把 ⇒ 提示', (() => {
 	const rows = [0, 1, 2, 3, 4].map((n) => ({ sourceId: 's1', keyId: 'k' + n, kind: 'tavily', mode: 'env', ref: 'K' + n }))
 	return I.firstProblem({ sources: rows }) !== null
 })())
+// ★回归（2026-11-09 真机）：budgetMonthly/budgetReserve 为**空串**是合法语义（「用模板默认额度」）。
+// 服务端 readState 对没写 budget 的 key 返回 budget:null，draftFromState 会把它变成两个空串字段；
+// 旧守卫用 `!== undefined` 判「填了额度」，于是真实 state 派生的草稿每一行都被误判成 badBudget，
+// 红字指向不可编辑的隐藏行，且「保存」按钮被禁用。这条用例锁住修复。
+check('firstProblem：真实 state 派生的空额度行（budget:null）不该报 badBudget', (() => {
+	const realState = {
+		ok: true,
+		version: 3,
+		maxSources: 4,
+		maxKeys: 4,
+		templates: [{ kind: 'deepseek-api', label: 'DeepSeek 搜索 API', refExample: 'DEEPSEEK_API_KEY', unit: 'calls' }],
+		defaults: { budgets: { 'deepseek-api': null } },
+		sources: [
+			{
+				id: 's4', kind: 'deepseek-api', billing: { unit: 'calls', pricePer1000: null },
+				keys: [{ id: 's4', mode: 'env', ref: 'DEEPSEEK_API_KEY', budget: null, credential: { configured: true, writable: false }, usage: { month: '2026-11', unit: 'calls', calls: 3, credits: 0, unlimited: true, monthly: null, reserve: 0, used: 3, remaining: null, exhausted: false, promo: null }, disabled: false, autoDisabled: null }],
+			},
+		],
+		fallback: { kind: 'deepseek', enabled: false },
+	}
+	const fromServer = I.draftFromState(realState)
+	return fromServer.sources[0].budgetMonthly === '' && fromServer.sources[0].budgetReserve === '' && I.firstProblem(fromServer) === null
+})())
+check('firstProblem：额度真填了但非法（负数/倒挂）仍要报 badBudget', (() => {
+	const bad = { sources: [{ kind: 'yuanbao', mode: 'env', ref: 'K1', secretId: 'AKIDxxxxxxxx', budgetMonthly: '10', budgetReserve: '11', used: '0' }] }
+	const negative = { sources: [{ kind: 'yuanbao', mode: 'env', ref: 'K1', secretId: 'AKIDxxxxxxxx', budgetMonthly: '-1', budgetReserve: '0', used: '0' }] }
+	return I.firstProblem(bad) !== null && I.firstProblem(negative) !== null
+})())
 check('recycledRefs：常态（仍是 literal）不误报；切走与删除都报', (() => {
 	const steady = I.recycledRefs(SERVER_STATE, I.draftFromState(SERVER_STATE))
 	const switched = I.recycledRefs(SERVER_STATE, I.setMode(I.draftFromState(SERVER_STATE), 1, 'env'))

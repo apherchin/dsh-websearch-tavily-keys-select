@@ -2,6 +2,7 @@
 
 DSH 的 Web 搜索链路：`元宝搜索（腾讯云 SearchPro，带额度闸门）→ Tavily（0~2 个）→ DeepSeek 搜索 API（5 元/千次）→ 官方 DeepSeek 搜索兜底（本机已关）`，
 并在侧栏 Plugins 的本包页面提供配置卡片（**Windows 环境变量 / 明文**两种密钥来源）。
+**3.1.0 起同时接管 `web_fetch`**：`本地 HTTP → Tavily Extract → DS 官方 Fetch（开关兜底）`，与搜索腿共享同一份 Tavily 源 / key / credits。
 **面向用户的说明见 [`bundle/README.md`](bundle/README.md)**（含额度/计费/查额度与控额度的完整说明）；本文件只写开发侧约定。
 
 ## 三个 npm 包（一个仓库）
@@ -22,7 +23,8 @@ DSH 的 Web 搜索链路：`元宝搜索（腾讯云 SearchPro，带额度闸门
 | `core.mjs` | 纯逻辑：文档形状/提交校验/腿序/凭据回收 + **额度算术（北京时间月、promo 到期、usage 账本）** |
 | `config-store.mjs` | I/O：配置文档 + 用量文档的读（绝不抛）与原子写 |
 | `tencent-sign.mjs` | 腾讯云 **TC3-HMAC-SHA256** 签名（零依赖、纯函数） |
-| `index-v5.mjs` | 运行时接线：注册 provider、Tavily/元宝两条腿、额度闸门、配置路由 |
+| `index-v5.mjs` | 运行时接线：注册搜索 provider、Tavily/元宝两条腿、额度闸门、配置路由；**3.1.0 起一并注册抓取梯队** |
+| `fetch-chain.mjs` | **3.1.0 新增**：`web_fetch` 抓取梯队（本地 HTTP → Tavily Extract → DS Fetch），共享配置文档、用满切 key、北京时间跨月恢复，审计写 `$DSH_HOME\web-fetch-chain.log` |
 
 ## 正本 ↔ 生成物（⚠️ 两套布局）
 

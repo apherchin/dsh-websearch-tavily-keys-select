@@ -6,6 +6,10 @@
 源有三种模板：**腾讯元宝搜索**（腾讯云 `SearchPro`，SecretId + SecretKey 签名，带额度闸门）、**DeepSeek 搜索 API**（REST，5 元/千次）和 **Tavily**（一个 key）。推荐腿序：元宝 → Tavily → DS 搜索 API。
 密钥可取 Windows 环境变量，也可直接输入明文。配置卡片就在**侧栏 Plugins → bundle 包页**上。
 
+> **3.1.0 起同一个包也接管 `web_fetch`**：`本地 HTTP（免费）→ Tavily Extract（credits）→ DS 官方 Fetch（开关兜底）`。
+> 抓取腿与搜索腿**共享** `$DSH_HOME\web-search-chain.json` 里的 Tavily 源 / key / credits；某把 key 用满自动切下一把，两把都尽才落 DS；
+> 「用满」记忆按北京时间自然月自动恢复。详见下方 [web_fetch 抓取梯队](#web_fetch-抓取梯队-310)。
+
 > **改配置不用重启 DSH**：链路每次搜索都重读配置文档。
 
 ![配置卡片：搜索源 1 / 搜索源 2、添加搜索源、官方兜底开关、下方「包含的组件」与各自启停开关](assets/config-page.png)
@@ -26,6 +30,30 @@
 - **密钥不进 DSH 的明文**：SecretKey / Tavily key 优先用 **Windows 环境变量**（密钥留在系统里）；
   只有 **SecretId** 明文存在配置文档里（它按腾讯云的定义是"类比用户名"的标识，且必须方便更换）。
 - **可换**：SecretId 在卡片上直接改；SecretKey 换环境变量的值（或改成明文模式）；额度/保留余量也在卡片上改。
+
+### web_fetch 抓取梯队（3.1.0）
+
+DSH 的 `ctx.web` 把搜索与抓取分成两个独立注册表。3.1.0 起本包在注册搜索 provider 的同时注册 `chain-fetch`：
+
+| 腿 | 成本 | 何时用 |
+|---|---|---|
+| `http-leg` | 免费 | 静态页能直连拿到正文 |
+| `tavily-extract` | basic：每 5 次成功 URL = 1 credit；**提取失败不收费** | 本地腿 403/412/超时/空正文等 |
+| `deepseek-fetch-api` | 0.005 元/成功次 | Tavily 两把 key 都用尽 / 全失败，且 `dsFetchFallback: true` |
+
+- **共享额度**：抓取直接读 `$DSH_HOME\web-search-chain.json` 的 Tavily 源与 key，与 `web_search` 共用同一份 credits，**不另立账本**。
+  上游报 402/429/432 或额度文案时，进程内记住该 key 并切下一把；两把都尽才落到 DS。
+- **每月自动恢复**：「用满」记忆按**北京时间自然月**自动清空（每月 1 号，东八区），不用改配置、不用重启、不用人记。
+  跨月时 `$DSH_HOME\web-fetch-chain.log` 写一行 `tavily-extract-quota-reset`。
+- **开关**：`fetch.dsFetchFallback: false` 即彻底不走 DS（本地 + Tavily 都失败时直接报错）。不做月度计数。
+- **启用方式**：装好本包后，把 profile 里 `web` 行的 `fetchProvider` 指向 `chain-fetch`（`config` 是整行替换语义，
+  **必须同时保留 `searchProvider: tavily-chain`**），再整机重启 DSH。本机若仍在用旧的绝对路径 `web-deepseek-api-proto` insert，
+  要先移除那条 insert，避免两个 `chain-fetch` 抢同一个 provider id。
+- 官方契约：[Tavily Extract](https://docs.tavily.com/documentation/api-reference/endpoint/extract)（HTTP 200 也可能 `results` 为空，
+  要同时看 `failed_results`）、[Credits & Pricing](https://docs.tavily.com/documentation/api-credits.md)。
+
+> 抓取审计独立写 `$DSH_HOME\web-fetch-chain.log`（`fetch-leg-served` / `tavily-extract-served` / `fetch-chain-failed`），
+> 与搜索链的 `web-search-chain.log` 分文件。
 
 ### 元宝搜索（腾讯云）
 

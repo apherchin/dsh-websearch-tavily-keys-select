@@ -63,6 +63,7 @@ import {
 	writeUsageDocument,
 } from './config-store.mjs'
 import { JSON_CONTENT_TYPE, buildTc3Authorization } from './tencent-sign.mjs'
+import { makeChainFetchProvider } from './fetch-chain.mjs'
 
 export const name = 'web-search-chain'
 export const inject = ['web']
@@ -376,6 +377,18 @@ export function normalizeChain(config) {
 			// 配置里写死就强制只用这些域名（逗号分隔）；不写 = 从 query 的 `site:` 记号里解析
 			site: optionalString(yuanbao.site),
 			timeoutMs: clampInteger(yuanbao.timeoutMs, 1, 600000, 30000),
+		},
+		// 3.1.0：web_fetch 抓取梯队。与搜索腿共享同一份配置文档与 Tavily keys；
+		// DS 兜底只留开关（dsFetchFallback），不计数。详见 ./fetch-chain.mjs。
+		fetch: {
+			dsFetchFallback: (source.fetch ?? {}).dsFetchFallback !== false,
+			baseURL: optionalString((source.fetch ?? {}).baseURL) ?? TAVILY_DEFAULT_BASE_URL,
+			extractDepth: ['basic', 'advanced'].includes((source.fetch ?? {}).extractDepth) ? source.fetch.extractDepth : 'basic',
+			format: ['markdown', 'text'].includes((source.fetch ?? {}).format) ? source.fetch.format : 'markdown',
+			timeoutMs: clampInteger((source.fetch ?? {}).timeoutMs, 1, 600000, 20000),
+			maxChars: clampInteger((source.fetch ?? {}).maxChars, 1, Number.MAX_SAFE_INTEGER, 100000),
+			deepseekBaseURL: optionalString((source.fetch ?? {}).deepseekBaseURL) ?? 'https://api.deepseek.com/v1/tools',
+			apiKeyEnv: optionalString((source.fetch ?? {}).apiKeyEnv) ?? DEFAULT_FALLBACK_REF,
 		},
 	}
 }
@@ -1137,11 +1150,14 @@ function probe(payload) {
 	}
 }
 
-/** 挂载链本体行：注册 seam 唯一被选中的搜索 provider + 自有配置路由。 */
+/** 挂载链本体行：注册 seam 唯一被选中的搜索 provider + 抓取梯队 + 自有配置路由。 */
 function applyChain(ctx, config) {
 	const current = normalizeChain(config)
 	const readDocument = () => readConfigDocument(configPath())
 	ctx.web.registerSearchProvider(new ChainSearchProvider(ctx, () => current, readDocument))
+	// 3.1.0：同一个 bundle 同时接管 web_fetch。放在搜索注册之后、配置路由之前，
+	// 且保持 inject: ['web'] 不变 ⇒ 不影响「connection 稍后就绪」那条时序回归。
+	ctx.web.registerFetchProvider?.(makeChainFetchProvider(ctx, current.fetch))
 	probe({ step: 'apply-chain', provider: current.id, inject: [...inject] })
 	registerConfigRoute(ctx)
 }
@@ -1364,14 +1380,87 @@ export async function resolveCredentialValue(ctx, reference) {
  *
  * @param ctx - 插件上下文（用于凭据域）。
  * @param ids - 要查的 **key id** 列表。
- * @param options - `{baseURL, timeoutMs}`（测试注入用）。
+ * @param options - `{baseURL, timeoutMs, retryDelayMs, maxRetryDelayMs, sleep}`（后三项测试注入用）。
  */
 export async function queryUsage(ctx, ids, options = {}) {
 	const { doc } = readConfigDocument(configPath())
 	const baseURL = (optionalString(options.baseURL) ?? TAVILY_DEFAULT_BASE_URL).replace(/\/+$/u, '')
-	const timeoutMs = Number.isInteger(options.timeoutMs) ? options.timeoutMs : 10000
+	// 2026-11-10 真机：Tavily `/usage` 在本机实测会慢到 14~25s（突发还会 429
+	// "excessive requests"）。旧的 10s 让卡片的「查额度」几乎必然报 timeout，
+	// 而同样的请求放宽到 30s 两把 key 都 ok（实测 13.8s）。这是只读动作，
+	// 放宽默认值不会放大任何写操作；显式注入的 `options.timeoutMs` 仍然优先。
+	const timeoutMs = Number.isInteger(options.timeoutMs) ? options.timeoutMs : 30000
+	const retryDelayMs = Number.isInteger(options.retryDelayMs) ? options.retryDelayMs : 1200
+	// Tavily 的 429 实测带 `Retry-After: 60`（秒）。等 1.2s 重试必然还是 429，
+	// 但真等 60s 又会让卡片长时间无响应 ⇒ 按响应头换算、夹到 15s 上限。
+	const maxRetryDelayMs = Number.isInteger(options.maxRetryDelayMs) ? options.maxRetryDelayMs : 15000
+	const sleep = typeof options.sleep === 'function' ? options.sleep : (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 	const wanted = Array.isArray(ids) ? ids.filter((id) => typeof id === 'string').slice(0, MAX_SOURCES * MAX_KEYS) : []
 	const results = {}
+
+	/**
+	 * 单把 key 的一次查询（含「瞬态失败重试一次」）。
+	 *
+	 * 瞬态 = 429 / 5xx / 超时 / 网络错误：这些在 Tavily 对 /usage 限流或偶发慢响应时
+	 * 都会出现，稍等一下重试通常就成功。401/403/404 之类是确定性的，不重试。
+	 * 返回 `{ok:true, ...}` 或 `{ok:false, error, retryable}`。
+	 */
+	async function fetchOne(key) {
+		for (let attempt = 0; attempt < 2; attempt += 1) {
+			let response
+			try {
+				response = await fetch(`${baseURL}/usage`, {
+					method: 'GET',
+					redirect: 'error',
+					headers: { authorization: `Bearer ${key}`, accept: 'application/json', 'user-agent': USER_AGENT },
+					signal: AbortSignal.timeout(timeoutMs),
+				})
+			} catch (error) {
+				const timedOut = error?.name === 'TimeoutError'
+				const errorText = timedOut ? 'timeout' : String(error?.message ?? error)
+				if (attempt === 0) {
+					await sleep(retryDelayMs)
+					continue
+				}
+				return { ok: false, error: timedOut ? '查询超时，请稍后重试' : errorText, retryable: true }
+			}
+			const text = await response.text()
+			let payload
+			try {
+				payload = JSON.parse(text)
+			} catch {
+				return { ok: false, error: `non-JSON body (HTTP ${response.status})`, retryable: false }
+			}
+			if (!response.ok) {
+				const detail = typeof payload?.detail?.error === 'string' ? payload.detail.error : `HTTP ${response.status}`
+				const retryable = response.status === 429 || response.status >= 500
+				if (retryable && attempt === 0) {
+					// 429 优先听上游的 Retry-After（实测 60s），但夹到上限免得卡片挂死
+					const header = Number(response.headers?.get?.('retry-after'))
+					const waitMs = response.status === 429 && Number.isFinite(header) && header > 0
+						? Math.min(Math.max(Math.round(header * 1000), retryDelayMs), maxRetryDelayMs)
+						: retryDelayMs
+					await sleep(waitMs)
+					continue
+				}
+				// 429 是「查得太频」，给用户能照做的一句中文，而不是上游英文原文
+				return { ok: false, error: response.status === 429 ? '查询过于频繁触发 Tavily 限流，请约 1 分钟后重试' : detail, retryable }
+			}
+			const account = payload?.account ?? {}
+			const keyInfo = payload?.key ?? {}
+			return {
+				ok: true,
+				plan: optionalString(account.current_plan),
+				planUsage: Number.isInteger(account.plan_usage) ? account.plan_usage : null,
+				planLimit: Number.isInteger(account.plan_limit) ? account.plan_limit : null,
+				keyUsage: Number.isInteger(keyInfo.usage) ? keyInfo.usage : null,
+				keyLimit: Number.isInteger(keyInfo.limit) ? keyInfo.limit : null,
+				searchUsage: Number.isInteger(account.search_usage) ? account.search_usage : null,
+			}
+		}
+		return { ok: false, error: '查询失败，请稍后重试', retryable: true }
+	}
+
 	for (const id of wanted) {
 		let found
 		for (const source of doc.sources) {
@@ -1394,41 +1483,12 @@ export async function queryUsage(ctx, ids, options = {}) {
 			results[id] = { ok: false, error: 'credential-missing' }
 			continue
 		}
-		try {
-			const response = await fetch(`${baseURL}/usage`, {
-				method: 'GET',
-				redirect: 'error',
-				headers: { authorization: `Bearer ${key}`, accept: 'application/json', 'user-agent': USER_AGENT },
-				signal: AbortSignal.timeout(timeoutMs),
-			})
-			const text = await response.text()
-			let payload
-			try {
-				payload = JSON.parse(text)
-			} catch {
-				results[id] = { ok: false, error: `non-JSON body (HTTP ${response.status})` }
-				continue
-			}
-			if (!response.ok) {
-				const detail = typeof payload?.detail?.error === 'string' ? payload.detail.error : `HTTP ${response.status}`
-				results[id] = { ok: false, error: detail }
-				continue
-			}
-			const account = payload?.account ?? {}
-			const keyInfo = payload?.key ?? {}
-			results[id] = {
-				ok: true,
-				source: found.source.id,
-				plan: optionalString(account.current_plan),
-				planUsage: Number.isInteger(account.plan_usage) ? account.plan_usage : null,
-				planLimit: Number.isInteger(account.plan_limit) ? account.plan_limit : null,
-				keyUsage: Number.isInteger(keyInfo.usage) ? keyInfo.usage : null,
-				keyLimit: Number.isInteger(keyInfo.limit) ? keyInfo.limit : null,
-				searchUsage: Number.isInteger(account.search_usage) ? account.search_usage : null,
-			}
-		} catch (error) {
-			results[id] = { ok: false, error: error?.name === 'TimeoutError' ? 'timeout' : String(error?.message ?? error) }
+		const one = await fetchOne(key)
+		if (one.ok === false) {
+			results[id] = { ok: false, error: one.error }
+			continue
 		}
+		results[id] = { ok: true, source: found.source.id, ...one }
 	}
 	return { ok: true, month: beijingMonthKey(Date.now()), results }
 }

@@ -46,3 +46,16 @@
           model: deepseek-v4-flash
           maxTokens: 4096
           maxUses: 5
+        # 3.1.0：web_fetch 抓取梯队（本地 HTTP → Tavily Extract → DS Fetch 开关兜底）。
+        # Tavily 源/key 直接读 $DSH_HOME\web-search-chain.json（与搜索腿共享，不另立账本）；
+        # 用满自动切下一把，两把都尽才落 DS；「用满」记忆按北京时间自然月自动恢复。
+        # 审计写到 $DSH_HOME\web-fetch-chain.log（与搜索链日志分文件）。
+        fetch:
+          dsFetchFallback: true          # false = 彻底不走 DS
+          baseURL: https://api.tavily.com
+          extractDepth: basic            # advanced = 2 credits / 5 URLs
+          format: markdown
+          timeoutMs: 20000
+          maxChars: 100000
+          deepseekBaseURL: https://api.deepseek.com/v1/tools
+          apiKeyEnv: DEEPSEEK_API_KEY
