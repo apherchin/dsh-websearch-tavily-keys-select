@@ -3,7 +3,7 @@
 ## 3.1.0（2026-11-14）
 
 **一个安装入口同时接管 `web_search` 与 `web_fetch`。** 原先 `web_fetch` 靠一个用绝对路径 `insert` 挂载的本地原型
-（`plugins/dsh-web-deepseek-api`）提供，换台机器就失效；本版把抓取梯队并入 bundle 宿主模块，随包发布。
+提供（2026-11-14 已退役，归档于 `archive\retired-dsh-web-deepseek-api-20261114\`），换台机器就失效；本版把抓取梯队并入 bundle 宿主模块，随包发布。
 
 ### 新增
 

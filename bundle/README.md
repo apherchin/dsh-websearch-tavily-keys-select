@@ -47,8 +47,8 @@ DSH 的 `ctx.web` 把搜索与抓取分成两个独立注册表。3.1.0 起本�
   跨月时 `$DSH_HOME\web-fetch-chain.log` 写一行 `tavily-extract-quota-reset`。
 - **开关**：`fetch.dsFetchFallback: false` 即彻底不走 DS（本地 + Tavily 都失败时直接报错）。不做月度计数。
 - **启用方式**：装好本包后，把 profile 里 `web` 行的 `fetchProvider` 指向 `chain-fetch`（`config` 是整行替换语义，
-  **必须同时保留 `searchProvider: tavily-chain`**），再整机重启 DSH。本机若仍在用旧的绝对路径 `web-deepseek-api-proto` insert，
-  要先移除那条 insert，避免两个 `chain-fetch` 抢同一个 provider id。
+  **必须同时保留 `searchProvider: tavily-chain`**），再整机重启 DSH。若之前挂过旧原型 `web-deepseek-api-proto` 的
+  绝对路径 insert，必须先移除它，避免两个 `chain-fetch` 抢同一个 provider id（该原型已于 2026-11-14 退役归档）。
 - 官方契约：[Tavily Extract](https://docs.tavily.com/documentation/api-reference/endpoint/extract)（HTTP 200 也可能 `results` 为空，
   要同时看 `failed_results`）、[Credits & Pricing](https://docs.tavily.com/documentation/api-credits.md)。
 
