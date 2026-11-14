@@ -153,6 +153,20 @@ const MUTANTS = [
 		replace: 'const calls = this.bumpUsage(source.id, month)',
 		test: 'test/chain-provider.test.mjs',
 	},
+	{
+		name: 'M19 抓取成功不记账（卡片永远少算 Extract 额度）',
+		file: 'bundle/host/fetch-chain.mjs',
+		find: "if (typeof this.onExtractSuccess === 'function') {",
+		replace: 'if (false) {',
+		test: 'test/credits-ledger.test.mjs',
+	},
+	{
+		name: 'M20 查额度把校正写进所有 key（没查的也被改）',
+		file: 'bundle/host/index-v5.mjs',
+		find: 'mutateUsage(month, id, (doc) => withUsageCorrection(doc, month, id, correction))',
+		replace: 'mutateUsage(month, id, (doc) => withUsageCorrection(doc, month, "s3", correction))',
+		test: 'test/credits-ledger.test.mjs',
+	},
 ]
 
 /** 复制正本（跳过 .tmp），返回副本根目录。 */

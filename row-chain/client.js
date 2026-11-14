@@ -104,6 +104,8 @@ window.__ModuleLoader__.load({
 				upstreamLine: (plan, used, limit) => `上游：${plan ?? "—"} ${used ?? "?"}/${limit ?? "?"} credits`,
 				upstreamFull: "已用满",
 				upstreamFailed: (reason) => `查额度失败：${reason}`,
+				breakdown: (search, fetch, correction) => `搜索 ${search} · 抓取 ${fetch}${correction === 0 ? "" : ` · 校正 ${correction > 0 ? "+" : ""}${correction}`} credits`,
+				correctionApplied: (value) => ` · 已校正 ${value > 0 ? "+" : ""}${value} credits`,
 				usageLine: (used, monthly, remaining) => `本月已用 ${used} / ${monthly} 次 · 还剩 ${remaining}`,
 				usageReserve: (reserve) => ` · 其中 ${reserve} 次作为余量不使用`,
 				usagePromo: (monthly, until) => ` · 活动额度 ${monthly} 次（至 ${until}，到期自动降回日常额度）`,
@@ -176,6 +178,8 @@ window.__ModuleLoader__.load({
 				upstreamLine: (plan, used, limit) => `Upstream: ${plan ?? "—"} ${used ?? "?"}/${limit ?? "?"} credits`,
 				upstreamFull: "exhausted",
 				upstreamFailed: (reason) => `Quota check failed: ${reason}`,
+				breakdown: (search, fetch, correction) => `search ${search} · fetch ${fetch}${correction === 0 ? "" : ` · correction ${correction > 0 ? "+" : ""}${correction}`} credits`,
+				correctionApplied: (value) => ` · corrected ${value > 0 ? "+" : ""}${value} credits`,
 				usageLine: (used, monthly, remaining) => `${used} / ${monthly} calls used this month · ${remaining} left`,
 				usageReserve: (reserve) => ` · ${reserve} calls held back as a reserve`,
 				usagePromo: (monthly, until) => ` · promotion quota ${monthly} calls (until ${until}, then back to the regular quota)`,
@@ -852,9 +856,10 @@ umber`）。 */
 				line = jsx("span", { style: S.hint, children: copy.loading }, `upstream-${index}`);
 			} else if (upstream !== null && upstream.ok === true) {
 				const full = Number.isInteger(upstream.planUsage) && Number.isInteger(upstream.planLimit) && upstream.planUsage >= upstream.planLimit;
+				const corrected = Number.isInteger(upstream.correctionApplied) ? copy.correctionApplied(upstream.correctionApplied) : "";
 				line = jsx(
 					"span",
-					{ children: `${copy.upstreamLine(upstream.plan, upstream.planUsage, upstream.planLimit)}${full ? ` · ${copy.upstreamFull}` : ""}` },
+					{ children: `${copy.upstreamLine(upstream.plan, upstream.planUsage, upstream.planLimit)}${full ? ` · ${copy.upstreamFull}` : ""}${corrected}` },
 					`upstream-${index}`,
 				);
 			} else if (upstream !== null) {
@@ -994,6 +999,14 @@ umber`）。 */
 								)
 							: null,
 						...(kind === "yuanbao" ? renderYuanbaoExtras(source, index, props) : []),
+						// 3.2.0：Tavily 每把 key 的分项（搜索 / 抓取 / 校正），源卡标题显示两者合计。
+						kind === "tavily" && source.usage !== null && source.usage !== undefined
+							? jsx("p", { style: S.hint, children: copy.breakdown(
+									Number.isInteger(source.usage.credits) ? source.usage.credits : 0,
+									Number.isInteger(source.usage.fetchCredits) ? source.usage.fetchCredits : 0,
+									Number.isInteger(source.usage.correction) ? source.usage.correction : 0,
+								) }, `breakdown-${index}`)
+							: null,
 						...renderUpstreamExtras(source, index, props),
 						jsx(AtomCheckbox, {
 							checked: isEnv,

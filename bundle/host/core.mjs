@@ -309,7 +309,10 @@ export function parseUsageText(text) {
 		const clean = {}
 		for (const [id, value] of Object.entries(counters)) {
 			if (!ID_PATTERN.test(id)) continue
-			// v1：数字 = 调用次数；v2：`{calls, credits}`（缺哪个都行）
+			// v1：数字 = 调用次数；v2：`{calls, credits}`；v3.2：再加
+			// `{fetchUrls, fetchCredits, credits_correction}`（缺哪个都行）。
+			// ⚠️ credits_correction 允许**负整数**（上游额度小于本地估算时的误差），
+			// 其余计数字段仍要求非负。
 			const entry = Number.isInteger(value)
 				? value >= 0
 					? { calls: value }
@@ -318,10 +321,13 @@ export function parseUsageText(text) {
 					? {
 							...(Number.isInteger(value.calls) && value.calls >= 0 ? { calls: value.calls } : {}),
 							...(Number.isInteger(value.credits) && value.credits >= 0 ? { credits: value.credits } : {}),
+							...(Number.isInteger(value.fetchUrls) && value.fetchUrls >= 0 ? { fetchUrls: value.fetchUrls } : {}),
+							...(Number.isInteger(value.fetchCredits) && value.fetchCredits >= 0 ? { fetchCredits: value.fetchCredits } : {}),
+							...(Number.isInteger(value.credits_correction) ? { credits_correction: value.credits_correction } : {}),
 						}
 					: undefined
 			if (entry === undefined) continue
-			if (entry.calls === undefined && entry.credits === undefined) continue
+			if (Object.keys(entry).length === 0) continue
 			clean[id] = entry
 		}
 		months[month] = clean
@@ -334,13 +340,22 @@ export function serializeUsageDocument(doc) {
 	return `${JSON.stringify({ version: USAGE_VERSION, months: doc.months }, null, 2)}\n`
 }
 
-/** 某月某源的账本条目 `{calls, credits}`（没有就是两个 0）。 */
+/** 某月某 key 的账本条目（3.2.0 五字段；旧文档缺字段一律当 0）。 */
 export function usageEntry(doc, month, sourceId) {
 	const value = doc?.months?.[month]?.[sourceId]
-	if (Number.isInteger(value) && value >= 0) return { calls: value, credits: 0 }
+	if (Number.isInteger(value) && value >= 0) {
+		return { calls: value, credits: 0, fetchUrls: 0, fetchCredits: 0, credits_correction: 0 }
+	}
+	const num = (key, signed = false) => {
+		const n = value?.[key]
+		return Number.isInteger(n) && (signed || n >= 0) ? n : 0
+	}
 	return {
-		calls: Number.isInteger(value?.calls) && value.calls >= 0 ? value.calls : 0,
-		credits: Number.isInteger(value?.credits) && value.credits >= 0 ? value.credits : 0,
+		calls: num('calls'),
+		credits: num('credits'),
+		fetchUrls: num('fetchUrls'),
+		fetchCredits: num('fetchCredits'),
+		credits_correction: num('credits_correction', true),
 	}
 }
 
@@ -349,9 +364,32 @@ export function usageCount(doc, month, sourceId) {
 	return usageEntry(doc, month, sourceId).calls
 }
 
-/** 读某月某源的已用 credit 数（没有就是 0；元宝这类按次计费的源恒为 0）。 */
+/** 读某月某源的搜索 credit 数（没有就是 0；元宝这类按次计费的源恒为 0）。 */
 export function usageCredits(doc, month, sourceId) {
 	return usageEntry(doc, month, sourceId).credits
+}
+
+/** 读某月某 key 的抓取成功 URL 次数。 */
+export function usageFetchUrls(doc, month, sourceId) {
+	return usageEntry(doc, month, sourceId).fetchUrls
+}
+
+/** 读某月某 key 的手工校正值（可为负；没查过额度就是 0）。 */
+export function usageCorrection(doc, month, sourceId) {
+	return usageEntry(doc, month, sourceId).credits_correction
+}
+
+/** 官方口径：basic 每 5 次成功 URL = 1 credit；advanced = 2 credits。 */
+export function fetchCreditsOf(fetchUrls, extractDepth) {
+	const n = Number.isInteger(fetchUrls) && fetchUrls > 0 ? fetchUrls : 0
+	if (n === 0) return 0
+	const perFive = extractDepth === 'advanced' ? 2 : 1
+	return Math.ceil(n / 5) * perFive
+}
+
+/** 显示用的合计：搜索 + 抓取折算 + 手工校正（负数只夹到 0，不回写账本）。 */
+export function usageTotalOf(entry) {
+	return Math.max(0, entry.credits + entry.fetchCredits + entry.credits_correction)
 }
 
 /**
@@ -365,16 +403,34 @@ export function usageCredits(doc, month, sourceId) {
  */
 function withUsageEntry(doc, month, sourceId, patch) {
 	if (!/^\d{4}-\d{2}$/.test(month) || !ID_PATTERN.test(sourceId)) return doc
-	const hasCalls = Number.isInteger(patch.calls) && patch.calls >= 0
-	const hasCredits = Number.isInteger(patch.credits) && patch.credits >= 0
-	if (!hasCalls && !hasCredits) return doc
+	// patch 里**至少一个**字段必须是合法值，否则原样返回（引用相等）：
+	// 保留旧语义「非法计数不覆盖旧值」，也避免无谓的写盘。
+	const valid = (key, signed = false) => {
+		const v = patch[key]
+		return Number.isInteger(v) && (signed || v >= 0)
+	}
+	const anyValid = ['calls', 'credits', 'fetchUrls', 'fetchCredits'].some((k) => valid(k))
+		|| valid('credits_correction', true)
+	if (!anyValid) return doc
 	const current = usageEntry(doc, month, sourceId)
-	const calls = Number.isInteger(patch.calls) && patch.calls >= 0 ? patch.calls : current.calls
-	const credits = Number.isInteger(patch.credits) && patch.credits >= 0 ? patch.credits : current.credits
-	// 只写非 0 的字段：元宝这类按次计费的源永远不出现 credits，文件更小也更好读
+	const pick = (key, signed = false) => {
+		const v = patch[key]
+		return Number.isInteger(v) && (signed || v >= 0) ? v : current[key]
+	}
+	const calls = pick('calls')
+	const credits = pick('credits')
+	const fetchUrls = pick('fetchUrls')
+	const fetchCredits = patch.fetchCredits === undefined && patch.fetchUrls !== undefined
+		? fetchCreditsOf(fetchUrls, patch.extractDepth)
+		: pick('fetchCredits')
+	const correction = pick('credits_correction', true)
+	// 只写非 0 的字段；correction 为负**必须写**（那是有效误差）。
 	const next = {}
 	if (calls > 0) next.calls = calls
 	if (credits > 0) next.credits = credits
+	if (fetchUrls > 0) next.fetchUrls = fetchUrls
+	if (fetchCredits > 0) next.fetchCredits = fetchCredits
+	if (correction !== 0) next.credits_correction = correction
 	if (Object.keys(next).length === 0) return doc
 	const keep = new Set([month, previousMonthKey(month)])
 	const months = {}
@@ -388,14 +444,24 @@ function withUsageEntry(doc, month, sourceId, patch) {
 	return { version: USAGE_VERSION, months }
 }
 
-/** 写入某月某源的已用**调用次数**（credits 保持不变）。 */
+/** 写入某月某源的已用**调用次数**（其余字段保持不变）。 */
 export function withUsageCount(doc, month, sourceId, value) {
 	return withUsageEntry(doc, month, sourceId, { calls: value })
 }
 
-/** 写入某月某源的已用 **credit**（调用次数保持不变）。 */
+/** 写入某月某源的搜索 **credit**（其余字段保持不变）。 */
 export function withUsageCredits(doc, month, sourceId, value) {
 	return withUsageEntry(doc, month, sourceId, { credits: value })
+}
+
+/** 抓取成功一次：fetchUrls +1 并按 extractDepth 重算 fetchCredits。 */
+export function withUsageFetch(doc, month, sourceId, fetchUrls, extractDepth = 'basic') {
+	return withUsageEntry(doc, month, sourceId, { fetchUrls, fetchCredits: fetchCreditsOf(fetchUrls, extractDepth) })
+}
+
+/** 手工查额度后写校正值（可为负/正；0 表示清掉误差）。 */
+export function withUsageCorrection(doc, month, sourceId, value) {
+	return withUsageEntry(doc, month, sourceId, { credits_correction: value })
 }
 //#endregion
 

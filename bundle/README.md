@@ -41,8 +41,12 @@ DSH 的 `ctx.web` 把搜索与抓取分成两个独立注册表。3.1.0 起本�
 | `tavily-extract` | basic：每 5 次成功 URL = 1 credit；**提取失败不收费** | 本地腿 403/412/超时/空正文等 |
 | `deepseek-fetch-api` | 0.005 元/成功次 | Tavily 两把 key 都用尽 / 全失败，且 `dsFetchFallback: true` |
 
-- **共享额度**：抓取直接读 `$DSH_HOME\web-search-chain.json` 的 Tavily 源与 key，与 `web_search` 共用同一份 credits，**不另立账本**。
-  上游报 402/429/432 或额度文案时，进程内记住该 key 并切下一把；两把都尽才落到 DS。
+- **共享源与 key，但 3.2.0 起分两份记账**：抓取直接读 `$DSH_HOME\web-search-chain.json` 的 Tavily 源与 key；
+  每把 key 的 `credits`（搜索）与 `fetchUrls → fetchCredits`（抓取，每 5 次成功 URL 折算 1 credit）分别累计，
+  卡片显示两者之和 + 手动校正值。上游报 402/429/432 或额度文案时，进程内记住该 key 并切下一把；两把都尽才落到 DS。
+- **手动查额度才校正**：「查额度」按钮只查被点的那把 key，成功后把
+  `上游 plan_usage − 本地(credits + fetchCredits)` 写进该 key 的 `credits_correction`（可为负/正）；
+  两个原始记账字段永不改动，没点的 key 保持 0。自动路径不会调用 `/usage`。
 - **每月自动恢复**：「用满」记忆按**北京时间自然月**自动清空（每月 1 号，东八区），不用改配置、不用重启、不用人记。
   跨月时 `$DSH_HOME\web-fetch-chain.log` 写一行 `tavily-extract-quota-reset`。
 - **开关**：`fetch.dsFetchFallback: false` 即彻底不走 DS（本地 + Tavily 都失败时直接报错）。不做月度计数。

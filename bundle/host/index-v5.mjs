@@ -47,9 +47,15 @@ import {
 	unusedRefs,
 	usageCount,
 	usageCredits,
+	usageEntry,
+	usageFetchUrls,
+	usageCorrection,
+	usageTotalOf,
 	validateSubmission,
 	withUsageCount,
 	withUsageCredits,
+	withUsageFetch,
+	withUsageCorrection,
 } from './core.mjs'
 import {
 	configDocumentPath,
@@ -116,6 +122,24 @@ const enabledFallback = new Map()
 const usageCache = new Map()
 /** 进程内的 **credit** 缓存（Tavily 按 credit 计量）；与 usageCache 同理取 max(文件, 缓存)。 */
 const creditCache = new Map()
+/** 3.2.0：抓取成功 URL 次数缓存（与 creditCache 同理，写盘失败也不许闸门/显示回退）。 */
+const fetchUrlsCache = new Map()
+
+/**
+ * 3.2.0：所有用量写入都走这里 —— **一次读-改-写**，保留 doc 里的其它字段，
+ * 避免搜索腿与抓取腿并发写同一个 usage.json 时互相覆盖。
+ * 写盘失败时由调用方各自推进内存缓存；这里只负责不抛。
+ */
+function mutateUsage(month, sourceId, transform) {
+	try {
+		const { doc } = readUsageDocument(usagePath())
+		const next = transform(doc)
+		if (next !== doc) writeUsageDocument(usagePath(), next)
+		return next
+	} catch {
+		return undefined
+	}
+}
 
 /** 尽最大努力写一条 warn：日志本身绝不许打穿调用方。 */
 function warn(ctx, message) {
@@ -655,12 +679,7 @@ export class ChainSearchProvider {
 	bumpUsage(sourceId, month) {
 		const next = this.usedThisMonth(sourceId, month) + 1
 		usageCache.set(`${month}:${sourceId}`, next)
-		try {
-			const { doc } = this.readUsage()
-			this.writeUsage(withUsageCount(doc, month, sourceId, next))
-		} catch {
-			// 写盘失败不影响搜索；缓存已经把闸门推进了
-		}
+		mutateUsage(month, sourceId, (doc) => withUsageCount(doc, month, sourceId, Math.max(usageCount(doc, month, sourceId), next)))
 		return next
 	}
 
@@ -676,12 +695,7 @@ export class ChainSearchProvider {
 		const amount = Number.isInteger(credits) && credits > 0 ? credits : 1
 		const next = this.creditsThisMonth(sourceId, month) + amount
 		creditCache.set(`${month}:${sourceId}`, next)
-		try {
-			const { doc } = this.readUsage()
-			this.writeUsage(withUsageCredits(doc, month, sourceId, next))
-		} catch {
-			// 同上：缓存已经推进
-		}
+		mutateUsage(month, sourceId, (doc) => withUsageCredits(doc, month, sourceId, Math.max(usageCredits(doc, month, sourceId), next)))
 		return next
 	}
 
@@ -1157,7 +1171,16 @@ function applyChain(ctx, config) {
 	ctx.web.registerSearchProvider(new ChainSearchProvider(ctx, () => current, readDocument))
 	// 3.1.0：同一个 bundle 同时接管 web_fetch。放在搜索注册之后、配置路由之前，
 	// 且保持 inject: ['web'] 不变 ⇒ 不影响「connection 稍后就绪」那条时序回归。
-	ctx.web.registerFetchProvider?.(makeChainFetchProvider(ctx, current.fetch))
+	// 3.2.0：注入抓取记账回调，与搜索共用 mutateUsage（读-改-写，不互相覆盖）。
+	const onExtractSuccess = (keyId, extractDepth) => {
+		const month = beijingMonthKey(Date.now())
+		const cacheKey = `${month}:${keyId}`
+		const next = Math.max(usageFetchUrls(readUsageDocument(usagePath()).doc, month, keyId), fetchUrlsCache.get(cacheKey) ?? 0) + 1
+		fetchUrlsCache.set(cacheKey, next)
+		mutateUsage(month, keyId, (doc) => withUsageFetch(doc, month, keyId, Math.max(usageFetchUrls(doc, month, keyId), next), extractDepth))
+		return next
+	}
+	ctx.web.registerFetchProvider?.(makeChainFetchProvider(ctx, current.fetch, { onExtractSuccess }))
 	probe({ step: 'apply-chain', provider: current.id, inject: [...inject] })
 	registerConfigRoute(ctx)
 }
@@ -1289,13 +1312,24 @@ export async function readState(ctx) {
 		const pricePer1000 = typeof source.billing?.pricePer1000 === 'number' ? source.billing.pricePer1000 : null
 		let callsTotal = 0
 		let creditsTotal = 0
+		let fetchUrlsTotal = 0
+		let fetchCreditsTotal = 0
+		let correctionTotal = 0
 		const keys = []
 		for (const key of source.keys ?? []) {
-			const calls = Math.max(usageCount(usage.doc, month, key.id), usageCache.get(`${month}:${key.id}`) ?? 0)
-			const credits = Math.max(usageCredits(usage.doc, month, key.id), creditCache.get(`${month}:${key.id}`) ?? 0)
+			const entry = usageEntry(usage.doc, month, key.id)
+			const calls = Math.max(entry.calls, usageCache.get(`${month}:${key.id}`) ?? 0)
+			const credits = Math.max(entry.credits, creditCache.get(`${month}:${key.id}`) ?? 0)
+			const fetchUrls = Math.max(entry.fetchUrls, fetchUrlsCache.get(`${month}:${key.id}`) ?? 0)
+			const fetchCredits = entry.fetchCredits
+			const correction = usageCorrection(usage.doc, month, key.id)
+			const combined = { ...entry, calls, credits, fetchUrls, fetchCredits, credits_correction: correction }
+			const used = unit === 'credits' ? usageTotalOf(combined) : calls
 			callsTotal += calls
 			creditsTotal += credits
-			const used = unit === 'credits' ? credits : calls
+			fetchUrlsTotal += fetchUrls
+			fetchCreditsTotal += fetchCredits
+			correctionTotal += correction
 			const budget = keyBudget(source, key) ?? null
 			keys.push({
 				id: key.id,
@@ -1304,12 +1338,14 @@ export async function readState(ctx) {
 				...(key.secretId === undefined ? {} : { secretId: key.secretId }),
 				budget,
 				credential: await describeCredential(ctx, key.ref),
-				usage: { month, unit, calls, credits, ...budgetStatus(keyBudget(source, key), used, Date.now()) },
+				// 3.2.0：闸门仍只看搜索 credits（校正值不参与），但 used 含抓取与校正供界面显示。
+				usage: { month, unit, calls, credits, fetchUrls, fetchCredits, correction,
+					...budgetStatus(keyBudget(source, key), unit === 'credits' ? credits : calls, Date.now()), used },
 				disabled: key.disabled === true,
 				autoDisabled: autoDisabledOf(runtime.state, key.id) ?? null,
 			})
 		}
-		const usedTotal = unit === 'credits' ? creditsTotal : callsTotal
+		const usedTotal = unit === 'credits' ? keys.reduce((sum, key) => sum + key.usage.used, 0) : callsTotal
 		const usableKeys = keys.filter((key) => key.disabled !== true && key.autoDisabled === null)
 		const exhaustedKeys = usableKeys.filter((key) => key.usage.exhausted).length
 		sources.push({
@@ -1324,6 +1360,9 @@ export async function readState(ctx) {
 				unit,
 				calls: callsTotal,
 				credits: creditsTotal,
+				fetchUrls: fetchUrlsTotal,
+				fetchCredits: fetchCreditsTotal,
+				correction: correctionTotal,
 				used: usedTotal,
 				// 钱的估算只给"有单价"的源；单位是"元/千单位"
 				spend: pricePer1000 === null ? null : Math.round((usedTotal / 1000) * pricePer1000 * 10000) / 10000,
@@ -1488,7 +1527,19 @@ export async function queryUsage(ctx, ids, options = {}) {
 			results[id] = { ok: false, error: one.error }
 			continue
 		}
-		results[id] = { ok: true, source: found.source.id, ...one }
+		// 3.2.0：手动查额度成功后，只给**这一把 key** 写校正误差。
+		// correction = 上游 plan_usage − 本地(搜索 credits + 抓取折算 credits)，可为负/正；
+		// 两个原始记账字段永不改动；没被查询的 key 完全不碰。
+		let correctionApplied = null
+		if (Number.isInteger(one.planUsage)) {
+			const month = beijingMonthKey(Date.now())
+			const entry = usageEntry(readUsageDocument(usagePath()).doc, month, id)
+			const local = entry.credits + entry.fetchCredits
+			const correction = one.planUsage - local
+			correctionApplied = correction
+			mutateUsage(month, id, (doc) => withUsageCorrection(doc, month, id, correction))
+		}
+		results[id] = { ok: true, source: found.source.id, ...one, correctionApplied }
 	}
 	return { ok: true, month: beijingMonthKey(Date.now()), results }
 }

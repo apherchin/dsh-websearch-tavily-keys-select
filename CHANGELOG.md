@@ -1,5 +1,24 @@
 # 变更记录
 
+## 3.2.0（2026-11-14）
+
+**Tavily credits 按 key 分账 + 手动查额度校正。** 3.1.0 的抓取梯队消耗 Tavily Extract 额度但不记本地账本，卡片「本月已用」只统计 `web_search`，因此显示偏低。
+
+### 新增
+
+- `usage.json` 每 key 扩为 `{calls, credits, fetchUrls, fetchCredits, credits_correction}`；旧文档自动兼容（缺字段当 0）。
+- **分两份记账**（各自按 key）：`credits` = `web_search` 成功响应的 `usage.credits`；`fetchUrls` = `web_fetch` 成功提取的 URL 次数，按官方口径折算 `fetchCredits`（basic 每 5 次成功 = 1 credit，advanced = 2；失败不记）。
+- 卡片「本月已用」= 各 key 的 `credits + fetchCredits + credits_correction` 之和；每把 key 行另显示 `搜索 X · 抓取 Y · 校正 ±Z` 分项。
+- **手动查额度才校正**：`POST queryUsage:[id]` 成功后只给**该 key** 写 `credits_correction = 上游 plan_usage − 本地(credits + fetchCredits)`（可为负/正）；两个原始记账字段永不改动，没查的 key 校正值保持 0。查询失败不写。自动路径（搜索/抓取/打开页面/保存）**一次 `/usage` 请求都不发**。
+- 搜索与抓取共用一个 `mutateUsage()` 读-改-写助手（保留对方字段），避免并发写同一账本互相覆盖。
+- `credits_correction` 不参与额度闸门（只影响显示）；闸门仍靠搜索 credits + 上游 432 切 key。
+
+### 兼容
+
+- v1 数字 / v2 `{calls,credits}` 账本自动读入，无需迁移。
+- 3.1.0 的腿序、配置段、跨月恢复、`ENTRY_KEY` 均不变。
+- 验证：宿主测试 11 文件全绿（新增 `credits-ledger.test.mjs` 10/10）、客户端验证台 74/74、变异、真机抓取记账与查额度校正。
+
 ## 3.1.0（2026-11-14）
 
 **一个安装入口同时接管 `web_search` 与 `web_fetch`。** 原先 `web_fetch` 靠一个用绝对路径 `insert` 挂载的本地原型

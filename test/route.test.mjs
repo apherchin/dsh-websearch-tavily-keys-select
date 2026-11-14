@@ -118,8 +118,8 @@ await test('GET：文件不存在时给默认文档 + 默认凭据状态 + 模�
 		{ kind: 'tavily', label: 'Tavily Key', refExample: 'TAVILY_API_KEY', unit: 'credits' },
 	])
 	const month = beijingMonthKey(Date.now())
-	// 默认文档是两个 Tavily 源 ⇒ 计量单位是 credits
-	const unlimitedUsage = { month, unit: 'credits', calls: 0, credits: 0, unlimited: true, monthly: null, reserve: 0, used: 0, remaining: null, exhausted: false, promo: null }
+	// 默认文档是两个 Tavily 源 ⇒ 计量单位是 credits（3.2.0：usage 多三个分账字段）
+	const unlimitedUsage = { month, unit: 'credits', calls: 0, credits: 0, fetchUrls: 0, fetchCredits: 0, correction: 0, unlimited: true, monthly: null, reserve: 0, used: 0, remaining: null, exhausted: false, promo: null }
 	const keyRow = (id, ref) => ({ id, mode: 'env', ref, budget: null, credential: { configured: false, writable: true }, usage: unlimitedUsage, disabled: false, autoDisabled: null })
 	assert.deepEqual(body.sources, [
 		{
@@ -128,7 +128,7 @@ await test('GET：文件不存在时给默认文档 + 默认凭据状态 + 模�
 			billing: { unit: 'credits', pricePer1000: null },
 			disabled: false,
 			keys: [keyRow('k1', 'TAVILY_API_KEY1'), keyRow('k2', 'TAVILY_API_KEY2')],
-			usage: { month, unit: 'credits', calls: 0, credits: 0, used: 0, spend: null },
+			usage: { month, unit: 'credits', calls: 0, credits: 0, fetchUrls: 0, fetchCredits: 0, correction: 0, used: 0, spend: null },
 			available: true,
 			exhausted: false,
 			usableKeys: 2,
@@ -442,7 +442,8 @@ await test('POST queryUsage：查上游 Tavily /usage（GET + Bearer），非 Ta
 		assert.equal(seen.url, 'https://api.tavily.com/usage')
 		assert.equal(seen.init.method, 'GET')
 		assert.equal(seen.init.headers.authorization, 'Bearer tvly-1')
-		assert.deepEqual(body.results.k1, { ok: true, source: 's1', plan: 'Researcher', planUsage: 1000, planLimit: 1000, keyUsage: 1000, keyLimit: null, searchUsage: 1000 })
+		// 3.2.0：查额度成功后会把「上游值 − 本地合计」作为校正值返回并落账
+		assert.deepEqual(body.results.k1, { ok: true, source: 's1', plan: 'Researcher', planUsage: 1000, planLimit: 1000, keyUsage: 1000, keyLimit: null, searchUsage: 1000, correctionApplied: 1000 })
 		assert.deepEqual(body.results.k2, { ok: false, error: 'unsupported-kind' })
 		assert.deepEqual(body.results.nope, { ok: false, error: 'unknown-key' })
 	} finally {

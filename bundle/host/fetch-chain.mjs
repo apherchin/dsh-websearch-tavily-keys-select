@@ -4,10 +4,12 @@
  * 腿序：本地 HTTP（免费）→ Tavily Extract（credits）→ DeepSeek 官方 Fetch API（开关式兜底）。
  *
  * 口径（用户 2026-11-14 定）：
- *   - Tavily 的 fetch 与 search **共享** `$DSH_HOME\web-search-chain.json` 的源 / key / credits，
- *     不另立账本；某把 key 上游报用满就切下一把；两把都尽才落到 DS。
+ *   - Tavily 的 fetch 与 search **共享** `$DSH_HOME\web-search-chain.json` 的源 / key，
+ *     但 3.2.0 起**分两份记账**：搜索 credits 与抓取 fetchUrls→fetchCredits 各自按 key 累计；
+ *     某把 key 上游报用满就切下一把；两把都尽才落到 DS。
  *   - DS 只由 `dsFetchFallback` 开关控制，不做月度计数。
  *   - 「用满」记忆按**北京时间自然月**自动恢复（每月 1 号，不用改配置 / 不用重启）。
+ *   - 抓取成功由 `onExtractSuccess(keyId, extractDepth)` 回调写账本（与搜索共用读-改-写助手）。
  *
  * 审计：`$DSH_HOME\web-fetch-chain.log`（与搜索链日志分文件，避免互相污染）。
  * 官方契约：[Tavily Extract](https://docs.tavily.com/documentation/api-reference/endpoint/extract)、
@@ -143,9 +145,11 @@ export class DeepSeekFetchApiProvider {
 /** Tavily Extract 腿：与搜索链共享配置文档与 credits。 */
 export class TavilyExtractLeg {
 	id = TAVILY_EXTRACT_ID
-	constructor({ ctx, settings }) {
+	constructor({ ctx, settings, onExtractSuccess = undefined }) {
 		this.ctx = ctx
 		this.settings = settings
+		// 3.2.0：抓取成功后按该 key 记 fetchUrls（由 index-v5 注入统一读-改-写助手）。
+		this.onExtractSuccess = onExtractSuccess
 		// 「这把 key 上游已用满」的进程内记忆，按北京时间自然月分桶 ⇒ 每月 1 号自动清空。
 		this.exhausted = new Set()
 		this.exhaustedMonth = beijingMonthKey(Date.now())
@@ -220,6 +224,11 @@ export class TavilyExtractLeg {
 					continue
 				}
 				log(this.settings, 'tavily-extract-served', { key: key.id, url: request.url, chars: hit.raw_content.length, attempts })
+				// 3.2.0：只记成功的 URL（官方失败不收费）；回调异常绝不影响抓取结果。
+				if (typeof this.onExtractSuccess === 'function') {
+					try { await this.onExtractSuccess(key.id, this.settings.extractDepth ?? 'basic') }
+					catch (error) { log(this.settings, 'tavily-extract-ledger-failed', { key: key.id, message: String(error?.message ?? error) }) }
+				}
 				const content = hit.raw_content
 				const maxChars = this.settings.maxChars ?? 100_000
 				const truncated = content.length > maxChars
@@ -269,7 +278,7 @@ export class ChainFetchProvider {
 }
 
 /** 组装并（由调用方）注册 chain-fetch provider。 */
-export function makeChainFetchProvider(ctx, settings = {}) {
+export function makeChainFetchProvider(ctx, settings = {}, hooks = {}) {
 	const normalized = {
 		baseURL: settings.baseURL ?? DEFAULT_TAVILY_BASE_URL,
 		extractDepth: settings.extractDepth ?? 'basic',
@@ -284,7 +293,7 @@ export function makeChainFetchProvider(ctx, settings = {}) {
 	// 腿各建一次并复用：Tavily 的「用满」是进程内状态，每次 fetch 都 new 会清空记忆。
 	const legs = [
 		new SimpleHttpFetchLeg({ timeoutMs: normalized.timeoutMs, maxChars: normalized.maxChars }),
-		new TavilyExtractLeg({ ctx, settings: normalized }),
+		new TavilyExtractLeg({ ctx, settings: normalized, onExtractSuccess: hooks.onExtractSuccess }),
 		...(normalized.dsFetchFallback ? [new DeepSeekFetchApiProvider({ ctx, settings: normalized })] : []),
 	]
 	return new ChainFetchProvider({ legs, settings: normalized })

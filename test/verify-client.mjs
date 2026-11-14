@@ -327,6 +327,26 @@ check('渲染：Tavily 是一张卡里两把 key（而不是两张卡各一把�
 	return text.includes('源 s2') && text.includes('本源共 2 把 key') && text.includes('TAVILY_API_KEY2') && text.includes('密钥 2')
 })())
 
+check('渲染：Tavily 每把 key 显示搜索/抓取/校正分项（3.2.0）', (() => {
+	const rows = [{
+		sourceId: 's9', keyId: 'k9', kind: 'tavily', unit: 'credits', mode: 'env', ref: 'K9',
+		disabled: false, usage: { credits: 3, fetchCredits: 2, correction: -1, used: 4 },
+	}]
+	const group = I.groupRows({ sources: rows })[0]
+	const tree = expandAll(I.renderSourceCard(group, SERVER_STATE.templates, { edit: () => {}, queryUsage: () => {}, state: SERVER_STATE, keyOrdinals: { 0: 0 } }))
+	return JSON.stringify(tree).includes('搜索 3 · 抓取 2 · 校正 -1')
+})())
+check('查额度返回 correctionApplied 时上游行显示已校正', (() => {
+	const rows = [{
+		sourceId: 's9', keyId: 'k9', kind: 'tavily', unit: 'credits', mode: 'env', ref: 'K9',
+		disabled: false, usage: { credits: 0, fetchCredits: 0, correction: 0, used: 0 },
+		upstream: { ok: true, plan: 'Researcher', planUsage: 10, planLimit: 1000, correctionApplied: 7 },
+	}]
+	const group = I.groupRows({ sources: rows })[0]
+	const tree = expandAll(I.renderSourceCard(group, SERVER_STATE.templates, { edit: () => {}, queryUsage: () => {}, state: SERVER_STATE, keyOrdinals: { 0: 0 } }))
+	return JSON.stringify(tree).includes('已校正 +7')
+})())
+
 check('toRequest：按 sourceId 分组还原三级结构（同一源的两把 key 合成一个源）', (() => {
 	const req = I.toRequest(draft)
 	return eq(req.sources.map((s) => [s.id, s.kind, s.keys.length]), [['s1', 'yuanbao', 1], ['s2', 'tavily', 2]]) &&
